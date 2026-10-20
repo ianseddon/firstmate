@@ -10,6 +10,7 @@
 #                 "PRESENTATION_UNAVAILABLE: lavish-axi (requires >=<floor>; install: <command>) - nonvisual work may proceed with plain-text decisions and reports; install or upgrade before using Lavish",
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
+#                 "WORKTREE_PROVIDER_INVALID: <name> (known: <names>; fix ...)",
 #                 "STARTUP_MEMORY_BUDGET: invalid config/startup-memory-budget - <reason>",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
@@ -60,7 +61,8 @@
 #          `setup hooks` or a `curl | sh` installer. MISSING stays for absent
 #          tools only.
 #          treehouse is OUTDATED when its installed version lacks
-#          "treehouse get --lease" support.
+#          "treehouse get --lease" support; that check runs only when the
+#          resolved backend and worktree provider require treehouse.
 #          no-mistakes is OUTDATED when its installed version is older than
 #          1.46.0 (structured pipeline attestation floor; see CONTRIBUTING.md).
 #          The AXI-family floor policy is owned beside GH_AXI_MIN and
@@ -894,6 +896,7 @@ manual_install_url() {
     rex) echo "https://www.superlogical.com/rex" ;;
     tern) echo "https://stencil.so/tern" ;;
     cursor-agent) echo "https://cursor.com/cli" ;;
+    wt) echo "https://worktrunk.dev" ;;
     *) return 1 ;;
   esac
 }
@@ -907,11 +910,13 @@ missing_tool_diagnostic() {
   echo "MISSING: $tool (install: $(install_cmd "$tool"))"
 }
 
-# Required-tool detection follows the RESOLVED backend, not a one-size default:
-# a universal toolchain every home needs plus the backend-specific delta owned by
-# fm_backend_required_tools (bin/fm-backend.sh). So a herdr/zellij/cmux/tern home is
-# never told tmux is missing, and only orca drops treehouse. A backend value with
-# no verified dependency set is reported before the universal checks continue.
+# Required-tool detection follows the RESOLVED backend and worktree provider,
+# not a one-size default: a universal toolchain every home needs plus the
+# backend-specific delta owned by fm_backend_required_tools (bin/fm-backend.sh).
+# So a herdr/zellij/cmux/tern home is never told tmux is missing, a worktrunk
+# home is never told treehouse is missing, and orca drops any worktree provider.
+# A backend or worktree-provider value with no verified dependency set is
+# reported before the universal checks continue.
 COMMON_TOOLS="node git gh no-mistakes gh-axi chrome-devtools-axi tasks-axi quota-axi"
 BACKEND=$(fm_backend_name)
 BACKEND_VALID=1
@@ -919,6 +924,7 @@ if ! BACKEND_TOOLS=$(fm_backend_required_tools "$BACKEND"); then
   BACKEND_VALID=0
   BACKEND_TOOLS=""
 fi
+WORKTREE_PROVIDER=$(fm_worktree_provider_name)
 TOOLS="$BACKEND_TOOLS $COMMON_TOOLS"
 NO_MISTAKES_MIN=1.46.0
 # AXI-FAMILY FLOOR POLICY. Every axi-family floor is the CURRENT LATEST published
@@ -1402,7 +1408,7 @@ backlog_record_reconcile() {
       return 2
     fi
     if [ "$(fm_meta_get "$meta" kind)" != secondmate ] \
-       && [ "$(fm_meta_get "$meta" cleanup_recovery)" != orca ]; then
+       && [ -z "$(fm_meta_get "$meta" cleanup_recovery)" ]; then
       row=
       if fm_backlog_row_probe "$DATA" "$id"; then
         row=$FM_BACKLOG_ROW_STATE
@@ -1491,7 +1497,7 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ] && local_phase; then
           exit 1
         fi
         if [ "$(fm_meta_get "$BOOTSTRAP_BACKLOG_META" kind)" != secondmate ] \
-           && [ "$(fm_meta_get "$BOOTSTRAP_BACKLOG_META" cleanup_recovery)" != orca ]; then
+           && [ -z "$(fm_meta_get "$BOOTSTRAP_BACKLOG_META" cleanup_recovery)" ]; then
           BOOTSTRAP_BACKLOG_GATE_KIND=ship
           break
         fi
@@ -1524,6 +1530,9 @@ detect_local_tools() {
   if [ "$BACKEND_VALID" -eq 0 ]; then
     echo "BACKEND_INVALID: $BACKEND (known: $FM_BACKEND_KNOWN)"
   fi
+  if ! fm_worktree_provider_validate "$WORKTREE_PROVIDER" 2>/dev/null; then
+    echo "WORKTREE_PROVIDER_INVALID: $WORKTREE_PROVIDER (known: $FM_WORKTREE_PROVIDER_KNOWN; fix config/worktree-provider or FM_WORKTREE_PROVIDER)"
+  fi
   for t in $BACKEND_TOOLS; do
     fm_backend_required_tool_available "$BACKEND" "$t" \
       || missing_tool_diagnostic "$t"
@@ -1532,8 +1541,9 @@ detect_local_tools() {
     command -v "$t" >/dev/null || missing_tool_diagnostic "$t"
   done
   # The treehouse lease-support upgrade check is only relevant when the resolved
-  # backend actually requires treehouse (every backend except orca, which owns its
-  # own worktrees); an orca home must not be told to upgrade a provider it never uses.
+  # backend and worktree provider actually require treehouse (not orca, which owns
+  # its own worktrees, and not the worktrunk provider); such a home must not be
+  # told to upgrade a provider it never uses.
   if fm_backend_list_contains "$TOOLS" treehouse \
     && command -v treehouse >/dev/null 2>&1 && ! treehouse_supports_lease; then
     echo "OUTDATED: treehouse (installed: $(tool_version treehouse); requires --lease support; upgrade: $(upgrade_cmd treehouse))"

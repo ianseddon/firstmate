@@ -1467,6 +1467,34 @@ test_base_branch_is_rendered_and_bounded() {
 # (a) An unregistered/default project - no --branch-prefix passed at all - must
 # keep every generated ship mode's branch on the legacy "fm/<task-id>" name, byte
 # for byte, so every existing firstmate installation is unaffected.
+# Under the worktrunk worktree provider firstmate creates the task branch with
+# the worktree, so a ship brief confirms that branch instead of creating it, a
+# scout brief names its scout branch, and treehouse homes keep the old step.
+test_worktrunk_provider_briefs_confirm_the_created_branch() {
+  local home brief
+  home="$TMP_ROOT/worktrunk-provider-home"
+  mkdir -p "$home/data" "$home/config"
+  printf '%s\n' worktrunk > "$home/config/worktree-provider"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" wt-ship-brief some-proj --mode direct-PR --branch-prefix feat/ >/dev/null 2>&1 \
+    || fail "worktrunk ship brief failed to scaffold"
+  brief="$home/data/wt-ship-brief/brief.md"
+  # shellcheck disable=SC2016  # literal backticks must stay unexpanded
+  assert_grep 'First action: confirm you are on your branch: `git branch --show-current` must print `feat/wt-ship-brief`' "$brief" \
+    "worktrunk ship brief did not tell the worker to confirm the branch firstmate created"
+  # shellcheck disable=SC2016
+  assert_grep 'on the branch `feat/wt-ship-brief`, which firstmate created for this task' "$brief" \
+    "worktrunk ship brief Setup still described a detached HEAD"
+  assert_no_grep 'First action: create your branch' "$brief" \
+    "worktrunk ship brief still told the worker to create the existing branch"
+  assert_grep 'wt switch' "$brief" "worktrunk ship brief did not name worktrunk administration commands"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" wt-scout-brief some-proj --scout >/dev/null 2>&1 \
+    || fail "worktrunk scout brief failed to scaffold"
+  # shellcheck disable=SC2016
+  assert_grep 'on the branch `scout/wt-scout-brief`' "$home/data/wt-scout-brief/brief.md" \
+    "worktrunk scout brief did not name its scout branch"
+  pass "fm-brief.sh: a worktrunk home's briefs confirm the branch firstmate created"
+}
+
 test_ship_branch_prefix_defaults_to_legacy_fm() {
   local home id mode brief
   home="$TMP_ROOT/branch-prefix-default-home"
@@ -1725,6 +1753,7 @@ test_wait_no_turns_absent_keeps_the_previous_brief
 test_inbox_guidance_explains_marked_body_terminator
 test_home_brief_include_is_appended_last
 test_base_branch_is_rendered_and_bounded
+test_worktrunk_provider_briefs_confirm_the_created_branch
 test_ship_branch_prefix_defaults_to_legacy_fm
 test_ship_branch_prefix_override_is_consistent_across_modes
 test_ship_branch_prefix_empty_override_yields_bare_task_id

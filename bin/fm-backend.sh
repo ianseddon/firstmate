@@ -521,6 +521,65 @@ fm_backend_validate_spawn() {  # <name>
   return 1
 }
 
+# Worktree providers for session-provider-only backends (every spawn backend
+# except orca, which owns its own task worktree and ignores this setting).
+# treehouse hands out pooled slots; worktrunk creates and removes one `wt`
+# worktree per task. docs/configuration.md "Worktree provider" owns the
+# operator contract.
+FM_WORKTREE_PROVIDER_KNOWN="treehouse worktrunk"
+
+# fm_worktree_provider_name: resolve this home's worktree provider for a NEW
+# spawn. Precedence: FM_WORKTREE_PROVIDER env, then config/worktree-provider
+# (its first non-empty, non-comment line), then the default treehouse. The value
+# is printed as given; fm_worktree_provider_validate refuses an unknown one
+# rather than falling back, so a typo never silently selects treehouse. A
+# recorded task reads its provider from its meta instead
+# (fm_worktree_provider_of_meta), never from this current setting.
+fm_worktree_provider_name() {
+  local line v
+  if [ -n "${FM_WORKTREE_PROVIDER:-}" ]; then
+    printf '%s' "$FM_WORKTREE_PROVIDER"
+    return 0
+  fi
+  if [ -f "$FM_BACKEND_CONFIG_DIR/worktree-provider" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      v=$(printf '%s' "$line" | tr -d '[:space:]')
+      case "$v" in
+        ''|'#'*) continue ;;
+      esac
+      printf '%s' "$v"
+      return 0
+    done < "$FM_BACKEND_CONFIG_DIR/worktree-provider"
+  fi
+  printf 'treehouse'
+}
+
+# fm_worktree_provider_validate: refuse an unknown provider LOUDLY. Silent on success.
+fm_worktree_provider_validate() {  # <name>
+  if ! fm_backend_list_contains "$FM_WORKTREE_PROVIDER_KNOWN" "$1"; then
+    echo "error: unknown worktree provider '$1' (known: $FM_WORKTREE_PROVIDER_KNOWN); fix config/worktree-provider or FM_WORKTREE_PROVIDER" >&2
+    return 1
+  fi
+}
+
+# fm_worktree_provider_tool: the CLI a known provider runs.
+fm_worktree_provider_tool() {  # <provider>
+  case "$1" in
+    treehouse) printf '%s' treehouse ;;
+    worktrunk) printf '%s' wt ;;
+    *) return 1 ;;
+  esac
+}
+
+# fm_worktree_provider_of_meta: the provider that created a recorded task's
+# worktree. Records written before worktree_provider= existed, and every
+# treehouse task, omit the key, which means treehouse.
+fm_worktree_provider_of_meta() {  # <meta-file>
+  local provider
+  provider=$(fm_meta_get "$1" worktree_provider)
+  printf '%s' "${provider:-treehouse}"
+}
+
 # fm_backend_required_tools: the backend-SPECIFIC CLI tools a firstmate home on
 # <backend> genuinely requires, beyond firstmate's universal toolchain (owned by
 # docs/configuration.md "Toolchain" and bootstrap's COMMON list). This is the
@@ -529,28 +588,42 @@ fm_backend_validate_spawn() {  # <name>
 #   - the session-provider CLI itself (tmux/herdr/zellij/orca/cmux/paseo/rex/tern);
 #   - jq, for the JSON-emitting adapters (herdr, zellij, cmux, paseo, rex, tern) whose spawn/liveness
 #     paths parse the backend's JSON output (see each adapter's
-#     tool check, e.g. fm_backend_herdr_tool_check);
-#   - the treehouse worktree provider for every session-provider-only backend
-#     (tmux, herdr, zellij, cmux, paseo, rex, t3code, tern); orca owns its own task worktree and
-#     terminal, so it drops both treehouse and any other backend's session CLI;
-#   - node for t3code, whose adapter speaks MCP to the T3 server through
-#     bin/fm-t3-mcp.mjs.
+#     tool check, e.g. fm_backend_herdr_tool_check), and for the worktrunk
+#     provider, whose `wt switch --format json` result spawn parses;
+#   - the resolved worktree provider's CLI (treehouse, or wt for worktrunk;
+#     fm_worktree_provider_name) for every session-provider-only backend
+#     (tmux, herdr, zellij, cmux, paseo, rex, tern, hc); orca owns its own
+#     task worktree and terminal, so it drops any worktree provider and any other
+#     backend's session CLI. An unknown provider contributes no tool; bootstrap
+#     reports it separately and spawn refuses it;
+#   - node plus treehouse for t3code, whose adapter speaks MCP to the T3 server
+#     through bin/fm-t3-mcp.mjs and leases its own treehouse slot whatever the
+#     worktree provider (spawn refuses worktrunk there).
 # Prints a single space-separated line and returns 0 for a known backend; returns
 # 1 and prints nothing for an unknown backend.
 fm_backend_required_tools() {  # <backend>
+  local session provider_tools=
   case "$1" in
-    tmux)   printf '%s' 'tmux treehouse' ;;
-    herdr)  printf '%s' 'herdr jq treehouse' ;;
-    zellij) printf '%s' 'zellij jq treehouse' ;;
-    cmux)   printf '%s' 'cmux jq treehouse' ;;
-    paseo)  printf '%s' 'paseo jq treehouse' ;;
-    rex)    printf '%s' 'rex jq treehouse' ;;
-    tern)   printf '%s' 'tern jq treehouse' ;;
-    hc)     printf '%s' 'hc jq treehouse' ;;
-    orca)   printf '%s' 'orca' ;;
-    t3code) printf '%s' 'node treehouse' ;;
+    tmux)   session='tmux' ;;
+    herdr)  session='herdr jq' ;;
+    zellij) session='zellij jq' ;;
+    cmux)   session='cmux jq' ;;
+    paseo)  session='paseo jq' ;;
+    rex)    session='rex jq' ;;
+    tern)   session='tern jq' ;;
+    hc)     session='hc jq' ;;
+    t3code) printf '%s' 'node treehouse'; return 0 ;;
+    orca)   printf '%s' 'orca'; return 0 ;;
     *) return 1 ;;
   esac
+  case "$(fm_worktree_provider_name)" in
+    treehouse) provider_tools='treehouse' ;;
+    worktrunk)
+      provider_tools='wt'
+      fm_backend_list_contains "$session" jq || provider_tools='wt jq'
+      ;;
+  esac
+  printf '%s' "$session${provider_tools:+ $provider_tools}"
 }
 
 fm_backend_required_tool_available() {  # <backend> <tool>

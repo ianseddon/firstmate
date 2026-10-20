@@ -112,6 +112,11 @@
 # disagrees, so an adjusted brief and the recorded task metadata cannot drift
 # apart.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
+# Ship and scout Setup follow this home's worktree provider as resolved at
+# scaffold time (bin/fm-backend.sh fm_worktree_provider_name): under worktrunk
+# firstmate creates the task branch with the worktree (a scout's is
+# scout/<task-id>), so Setup names it and the ship's branch step confirms it
+# instead of creating it.
 # Both crewmate scaffolds carry one shared rule against administering the
 # infrastructure every lane shares - the no-mistakes daemon and the worktree pool
 # their own slot came from - so ship and scout cannot drift apart. A secondmate
@@ -216,6 +221,9 @@ else
 fi
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 case "$CONFIG" in /*) ;; *) CONFIG="$PWD/$CONFIG" ;; esac
+# shellcheck source=bin/fm-backend.sh
+. "$SCRIPT_DIR/fm-backend.sh"
+FM_BACKEND_CONFIG_DIR=$CONFIG
 KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
@@ -673,8 +681,9 @@ IFS= read -r -d '' SHARED_INFRA_RULE <<'EOF' || true
      never write into a sibling slot's directory. Rule 2 does not cover this: removing a worktree
      is administration rather than an edit outside your directory, and it lands on lanes that are
      running right now. The act is the rule and commands are only examples of it - `treehouse`
-     get/return/remove/prune, the equivalent operations on any other worktree provider or runtime
-     backend, and `git worktree add|remove|move|prune`. A slot that looks unused is not evidence
+     get/return/remove/prune, worktrunk's `wt switch`/`wt remove`/`wt merge`, the equivalent
+     operations on any other worktree provider or runtime backend, and
+     `git worktree add|remove|move|prune`. A slot that looks unused is not evidence
      that it is free, and returning your own worktree is firstmate's job at cleanup, not yours.
    If you genuinely need a second checkout, another slot, or the daemon touched, append
    `blocked [at=<epoch>]: {what you need}` and stop; firstmate arranges it.
@@ -689,11 +698,27 @@ IFS= read -r -d '' SHARED_NO_CD_RULE <<'EOF' || true
 EOF
 SHARED_NO_CD_RULE=${SHARED_NO_CD_RULE%$'\n'}
 
+# The worktree provider decides what the worker starts on. treehouse (and Orca)
+# hand over a detached HEAD and the ship worker creates its branch; worktrunk
+# creates the task branch together with the worktree, so the worker confirms it.
+BRIEF_WORKTREE_BRANCH=
+if [ "$(fm_worktree_provider_name)" = worktrunk ]; then
+  if [ "$KIND" = scout ]; then
+    BRIEF_WORKTREE_BRANCH="scout/$ID"
+  else
+    BRIEF_WORKTREE_BRANCH=$BRANCH
+  fi
+fi
+if [ -n "$BRIEF_WORKTREE_BRANCH" ]; then
+  SETUP_HEAD="on the branch \`$BRIEF_WORKTREE_BRANCH\`, which firstmate created for this task from"
+else
+  SETUP_HEAD="at a detached HEAD on"
+fi
 if [ -n "$BASE_BRANCH" ]; then
-  SETUP_BASE="You are in a disposable git worktree of $REPO, at a detached HEAD on a clean copy of its base branch.
+  SETUP_BASE="You are in a disposable git worktree of $REPO, $SETUP_HEAD a clean copy of its base branch.
 Base branch: $BASE_BRANCH"
 else
-  SETUP_BASE="You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch."
+  SETUP_BASE="You are in a disposable git worktree of $REPO, $SETUP_HEAD a clean default branch."
 fi
 
 if [ "$KIND" = scout ]; then
@@ -777,6 +802,11 @@ case "$MODE" in
 esac
 RULE1=$(fm_ship_rule_one "$MODE" "$ID" "$BRANCH" "$FORGE" "$BASE_BRANCH") || exit 1
 DOD=$(fm_dod_block "$MODE" "$ID" "$BRANCH" "$FORGE" "$BASE_BRANCH" "$UPSTREAM_CONSENT" "$PR_TEXT") || exit 1
+if [ -n "$BRIEF_WORKTREE_BRANCH" ]; then
+  BRANCH_STEP="First action: confirm you are on your branch: \`git branch --show-current\` must print \`$BRANCH\`, which firstmate created and checked out with this worktree. If it prints nothing (a detached HEAD), create it with \`git checkout -b $BRANCH_Q --\`; if it prints any other branch, append \`blocked [at=<epoch>]: worktree is not on $BRANCH\` to the status file and stop."
+else
+  BRANCH_STEP="First action: create your branch: \`git checkout -b $BRANCH_Q --\`"
+fi
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -788,11 +818,11 @@ $HERDR_SECTION
 # Setup
 $SETUP_BASE
 
-**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
+**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path, a worktrunk worktree, or an Orca-managed worktree, not the primary checkout firstmate operates from.
 The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
 If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked [at=<epoch>]: launched in primary checkout, not an isolated worktree\` to the status file and stop.
 
-1. First action: create your branch: \`git checkout -b $BRANCH_Q --\`$SETUP2
+1. $BRANCH_STEP$SETUP2
 
 # Rules
 $RULE1

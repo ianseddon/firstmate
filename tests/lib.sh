@@ -58,6 +58,9 @@ export FM_TEST_SEAM=1
 # it runs a copied bin/fm-test-run.sh in, and that runner refuses the primary
 # under the marker. A case that verifies the refusal sets FM_TASK_ID itself.
 unset FM_TASK_ID
+# Clear the operator's worktree-provider override so a suite's own
+# config/worktree-provider (or its absence) decides, never the developer shell.
+unset FM_WORKTREE_PROVIDER
 
 # Clear the launcher identity, terminal marker, runtime-backend selector, and
 # home/state overrides a suite inherits from the terminal that started it. A

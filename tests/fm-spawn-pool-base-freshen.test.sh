@@ -12,6 +12,9 @@
 # publishing mode, a named base branch, a diverged or trailing primary, and an
 # unclean slot keep the rules above, and that the review starts where the slot
 # was planted.
+# The worktrunk cases drive the same spawn path with config/worktree-provider
+# set to worktrunk: acquisition through wt, the recorded provider, the
+# stale-branch and hook-approval refusals, and abort cleanup.
 set -u
 
 # shellcheck source=tests/fixtures.sh
@@ -1378,6 +1381,188 @@ test_opt_in_still_refuses_an_unclean_slot_first() {
   pass "with the opt-in an unclean slot is still refused, untouched, before any base is chosen"
 }
 
+# --- worktrunk worktree provider ---------------------------------------------
+# A home with config/worktree-provider=worktrunk acquires its task worktree by
+# running wt itself instead of typing `treehouse get` into the pane. The shared
+# fake wt (tests/fixtures.sh) does the real git work, so these cases assert
+# worktrees, branches, and records; a logging treehouse proves it is never used.
+# assert_line <line> <file> <msg>: <file> holds exactly that line.
+assert_line() {
+  grep -Fqx -- "$1" "$2" || fail "$3"
+}
+
+# assert_no_line_prefix <prefix> <file> <msg>: no line of <file> starts with it.
+assert_no_line_prefix() {
+  ! grep -q "^$1" "$2" || fail "$3"
+}
+
+make_worktrunk_case() {  # <name> <id>; sets the case globals plus WT_ROOT, WT_LOG
+  local rec
+  rec=$(make_case "$1" "$2")
+  read_case_record "$rec"
+  printf '%s\n' '# selected by the worktrunk spawn tests' worktrunk > "$HOME_DIR/config/worktree-provider"
+  fm_test_fake_wt "$FAKEBIN_DIR"
+  cat > "$FAKEBIN_DIR/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> '$CASE_DIR/treehouse.log'
+SH
+  chmod +x "$FAKEBIN_DIR/treehouse"
+  fm_test_fake_sleep_noop "$FAKEBIN_DIR"
+  WT_ROOT="$CASE_DIR/wt"
+  WT_LOG="$CASE_DIR/wt.log"
+  : > "$WT_LOG"
+}
+
+run_worktrunk_spawn() {  # <id> <pane-path> [fm-spawn args...]
+  local id=$1 pane=$2
+  shift 2
+  FM_FAKE_WT_ROOT="$WT_ROOT" FM_FAKE_WT_LOG="$WT_LOG" FM_FAKE_PANE_LOG="$CASE_DIR/pane.log" \
+    fm_test_run_spawn "$HOME_DIR" "$pane" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR" "$@"
+}
+
+test_worktrunk_ship_spawn_records_provider_and_worktree() {
+  local id out status wt
+  id='wt-conventional-ship'
+  make_worktrunk_case wt-ship "$id"
+  # A conventional-commit prefix: wt's sanitize turns the slash into a dash.
+  printf 'Ship branch: feat/%s\n' "$id" >> "$HOME_DIR/data/$id/brief.md"
+  wt="$WT_ROOT/feat-$id"
+
+  out=$(run_worktrunk_spawn "$id" "$wt" --mode direct-PR --yolo off --branch-prefix feat/)
+  status=$?
+  expect_code 0 "$status" "a worktrunk ship spawn should launch"$'\n'"$out"
+  assert_contains "$out" "spawned $id" "the worktrunk ship spawn did not report success"
+  assert_line "worktree=$wt" "$HOME_DIR/state/$id.meta" "the record does not name the wt worktree"
+  assert_line 'worktree_provider=worktrunk' "$HOME_DIR/state/$id.meta" "the record does not name its provider"
+  assert_line "worktree_branch=feat/$id" "$HOME_DIR/state/$id.meta" "the record does not name the wt branch"
+  assert_line "branch=feat/$id" "$HOME_DIR/state/$id.meta" "the record lost the ship branch"
+  [ "$(git -C "$wt" branch --show-current)" = "feat/$id" ] \
+    || fail "the worktree is not on the ship branch wt created"
+  [ "$(git -C "$wt" rev-parse HEAD)" = "$(git -C "$PROJECT_DIR" rev-parse origin/main)" ] \
+    || fail "the worktrunk worktree did not start at the freshly fetched origin/main"
+  assert_grep 'must survive a newly spawned branch' "$wt/advanced-main.txt" \
+    "the worktrunk worktree omitted advanced-main content"
+  assert_line "switch --create feat/$id --base origin/main --no-cd --format json" "$WT_LOG" \
+    "spawn did not create the worktree through wt switch --create"
+  assert_line "cd -- '$wt'" "$CASE_DIR/pane.log" "spawn did not move the pane into the wt worktree"
+  assert_no_grep 'treehouse' "$CASE_DIR/pane.log" "a worktrunk spawn typed a treehouse command"
+  [ ! -e "$CASE_DIR/treehouse.log" ] || fail "a worktrunk spawn ran treehouse: $(cat "$CASE_DIR/treehouse.log")"
+  pass "a worktrunk ship spawn creates its prefixed branch and worktree through wt and records both"
+}
+
+test_worktrunk_scout_spawn_uses_a_scout_branch() {
+  local id out status wt
+  id='wt-scout'
+  make_worktrunk_case wt-scout "$id"
+  wt="$WT_ROOT/scout-$id"
+
+  out=$(run_worktrunk_spawn "$id" "$wt" --scout)
+  status=$?
+  expect_code 0 "$status" "a worktrunk scout spawn should launch"$'\n'"$out"
+  assert_line "worktree=$wt" "$HOME_DIR/state/$id.meta" "the scout record does not name the wt worktree"
+  assert_line "worktree_branch=scout/$id" "$HOME_DIR/state/$id.meta" "the scout record does not name its scout branch"
+  assert_no_line_prefix 'branch=' "$HOME_DIR/state/$id.meta" "a scout record gained a ship branch"
+  [ "$(git -C "$wt" branch --show-current)" = "scout/$id" ] || fail "the scout worktree is not on scout/$id"
+  pass "a worktrunk scout spawn gets a scout-scoped branch from wt"
+}
+
+test_worktrunk_spawn_refuses_an_existing_task_branch() {
+  local id out status
+  id='wt-stale-branch'
+  make_worktrunk_case wt-stale "$id"
+  git -C "$PROJECT_DIR" branch "fm/$id"
+
+  out=$(run_worktrunk_spawn "$id" "$WT_ROOT/fm-$id" --mode direct-PR --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a worktrunk spawn adopted a pre-existing task branch"
+  assert_contains "$out" "branch fm/$id already exists" "the stale-branch refusal did not explain itself"
+  assert_no_grep 'switch --create' "$WT_LOG" "spawn ran wt switch over a stale task branch"
+  [ ! -e "$WT_ROOT/fm-$id" ] || fail "a refused spawn created a worktree"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "a refused spawn published task metadata"
+  pass "a worktrunk spawn refuses, before any endpoint, a task branch that already exists"
+}
+
+test_worktrunk_spawn_refuses_unapproved_project_hooks() {
+  local id out status
+  id='wt-unapproved'
+  make_worktrunk_case wt-unapproved "$id"
+
+  out=$(FM_FAKE_WT_APPROVAL_STATE=approval_required run_worktrunk_spawn "$id" "$WT_ROOT/fm-$id" --mode direct-PR --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a worktrunk spawn launched with unapproved project hooks"
+  assert_contains "$out" "config approvals add" "the approval refusal did not name its remedy"
+  assert_no_grep 'switch --create' "$WT_LOG" "spawn ran wt switch with unapproved hooks"
+  assert_no_grep ' --yes' "$WT_LOG" "spawn approved repo-controlled hooks itself"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "a refused spawn published task metadata"
+  pass "a worktrunk spawn refuses unapproved project hooks and names the approval remedy"
+}
+
+test_worktrunk_abort_after_creation_removes_worktree_and_branch() {
+  local id out status wt failure
+  # A failing pre-start hook leaves wt's worktree and branch behind; a later
+  # failure (the pane never reaches the worktree) leaves a clean one.
+  for failure in hook pane; do
+    id="wt-abort-$failure"
+    make_worktrunk_case "wt-abort-$failure" "$id"
+    wt="$WT_ROOT/fm-$id"
+    if [ "$failure" = hook ]; then
+      out=$(FM_FAKE_WT_SWITCH_FAIL_AFTER_CREATE=1 run_worktrunk_spawn "$id" "$wt" --mode direct-PR --yolo off)
+    else
+      out=$(run_worktrunk_spawn "$id" "$PROJECT_DIR" --mode direct-PR --yolo off)
+    fi
+    status=$?
+    [ "$status" -ne 0 ] || fail "$failure: the failing worktrunk spawn reported success"
+    assert_line "remove --foreground --force --force-delete $wt" "$WT_LOG" \
+      "$failure: the aborted spawn did not remove its wt worktree"
+    [ ! -e "$wt" ] || fail "$failure: the aborted spawn left its worktree behind"
+    ! git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/fm/$id" \
+      || fail "$failure: the aborted spawn left its branch behind"
+    [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "$failure: the aborted spawn left a task record"
+    pass "$failure: a worktrunk spawn that fails after creating its worktree removes it and its branch"
+  done
+}
+
+test_worktrunk_abort_removal_failure_writes_a_recovery_record() {
+  local id out status wt meta
+  id='wt-abort-keep'
+  make_worktrunk_case wt-abort-keep "$id"
+  wt="$WT_ROOT/fm-$id"
+
+  out=$(FM_FAKE_WT_SWITCH_FAIL_AFTER_CREATE=1 FM_FAKE_WT_REMOVE_FAIL=1 \
+    run_worktrunk_spawn "$id" "$wt" --mode direct-PR --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "the failing worktrunk spawn reported success"
+  meta="$HOME_DIR/state/$id.meta"
+  [ -d "$wt" ] || fail "the fixture did not keep the worktree whose removal failed"
+  assert_line 'cleanup_recovery=worktrunk' "$meta" "the kept worktree has no recovery record"
+  assert_line "worktree=$wt" "$meta" "the recovery record does not name the kept worktree"
+  assert_line 'worktree_provider=worktrunk' "$meta" "the recovery record does not name its provider"
+  assert_contains "$out" "bin/fm-teardown.sh $id" "the kept worktree was left without a pointer to its release"
+  pass "a worktrunk spawn whose cleanup removal fails publishes a cleanup_recovery record instead of a silent orphan"
+}
+
+test_unknown_worktree_provider_refuses_spawn() {
+  local id out status
+  id='wt-bogus-provider'
+  make_worktrunk_case wt-bogus "$id"
+  printf 'bogus\n' > "$HOME_DIR/config/worktree-provider"
+
+  out=$(run_worktrunk_spawn "$id" "$POOL_DIR" --mode direct-PR --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "an unknown worktree provider fell back instead of refusing"
+  assert_contains "$out" "unknown worktree provider 'bogus'" "the provider refusal did not name the value"
+  [ ! -e "$CASE_DIR/treehouse.log" ] || fail "an unknown provider fell back to treehouse"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "a refused spawn published task metadata"
+  pass "an unknown config/worktree-provider refuses the spawn rather than falling back"
+}
+
+test_worktrunk_ship_spawn_records_provider_and_worktree
+test_worktrunk_scout_spawn_uses_a_scout_branch
+test_worktrunk_spawn_refuses_an_existing_task_branch
+test_worktrunk_spawn_refuses_unapproved_project_hooks
+test_worktrunk_abort_after_creation_removes_worktree_and_branch
+test_worktrunk_abort_removal_failure_writes_a_recovery_record
+test_unknown_worktree_provider_refuses_spawn
 test_remote_seeded_home_spawns_from_treehouse_pool
 test_pool_slot_claim_follows_the_spawn_outcome
 test_refused_launch_leaves_the_pool_for_a_retry_and_a_second_task

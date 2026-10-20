@@ -7,8 +7,8 @@
 #
 # Generic reporters, temp roots, git fixtures, and fail/pass/fm_test_cleanup
 # come from tests/lib.sh, pulled in below. This file owns the shared fake
-# no-mistakes, gh, gh-axi, tmux, ssh, and spawn-world helpers. Wake-queue mocks
-# stay in wake-helpers.sh; secondmate-lifecycle mocks stay in
+# no-mistakes, gh, gh-axi, tmux, ssh, worktrunk (wt), and spawn-world helpers.
+# Wake-queue mocks stay in wake-helpers.sh; secondmate-lifecycle mocks stay in
 # secondmate-helpers.sh.
 #
 # FM_TEST_NO_MISTAKES_VERSION is the single default version for the shared fake
@@ -366,6 +366,82 @@ printf '%s\n' "${1:-}" >> "${FM_SLEEP_LOG:-/dev/null}"
 exit 0
 SH
   chmod +x "$fakebin/sleep"
+}
+
+# fm_test_fake_wt <fakebin>
+# A worktrunk stand-in that does the real git work for the three calls firstmate
+# makes, so suites can assert worktrees and branches rather than argv alone.
+# Every invocation is appended to FM_FAKE_WT_LOG (argv after the global -C).
+#   wt -C <dir> config approvals list --format json
+#       prints {"state":"$FM_FAKE_WT_APPROVAL_STATE"} (default no_commands).
+#   wt -C <dir> switch --create <branch> --base <base> --no-cd --format json
+#       runs `git worktree add -b <branch>` at
+#       $FM_FAKE_WT_ROOT/<branch with / as -> (worktrunk's sanitize) and prints
+#       the created JSON; FM_FAKE_WT_SWITCH_FAIL_AFTER_CREATE=1 then exits 7
+#       instead, leaving both behind as a failing real pre-start hook does.
+#   wt -C <dir> remove --foreground --force [-D|--force-delete|--no-delete-branch] <path>
+#       runs `git worktree remove --force`, deleting the branch only for -D;
+#       FM_FAKE_WT_REMOVE_FAIL=1 fails without removing anything.
+fm_test_fake_wt() {
+  local fakebin=$1
+  cat > "$fakebin/wt" <<'SH'
+#!/usr/bin/env bash
+set -u
+dir=.
+if [ "${1:-}" = -C ]; then
+  dir=$2
+  shift 2
+fi
+[ -z "${FM_FAKE_WT_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_WT_LOG"
+case "${1:-}" in
+  config)
+    printf '{"state":"%s","commands":[],"stale":[]}\n' "${FM_FAKE_WT_APPROVAL_STATE:-no_commands}"
+    ;;
+  switch)
+    shift
+    branch= base=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --base) base=$2; shift 2 ;;
+        --format) shift 2 ;;
+        --create|--no-cd) shift ;;
+        *) branch=$1; shift ;;
+      esac
+    done
+    path="$FM_FAKE_WT_ROOT/$(printf '%s' "$branch" | tr '/' '-')"
+    git -C "$dir" worktree add --quiet -b "$branch" "$path" "$base" >&2 || exit 1
+    if [ "${FM_FAKE_WT_SWITCH_FAIL_AFTER_CREATE:-0}" = 1 ]; then
+      echo "x pre-start command failed: exit status: 7" >&2
+      exit 7
+    fi
+    printf '{"action":"created","branch":"%s","path":"%s","created_branch":true,"base_branch":"%s"}\n' \
+      "$branch" "$path" "$base"
+    ;;
+  remove)
+    shift
+    delete=0 target=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -D|--force-delete) delete=1; shift ;;
+        --format) shift 2 ;;
+        -*) shift ;;
+        *) target=$1; shift ;;
+      esac
+    done
+    if [ "${FM_FAKE_WT_REMOVE_FAIL:-0}" = 1 ]; then
+      echo "x Cannot remove worktree (fake failure)" >&2
+      exit 1
+    fi
+    branch=$(git -C "$target" branch --show-current 2>/dev/null || true)
+    git -C "$dir" worktree remove --force "$target" >&2 || exit 1
+    if [ "$delete" = 1 ] && [ -n "$branch" ]; then
+      git -C "$dir" branch -D "$branch" >/dev/null || exit 1
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+SH
+  chmod +x "$fakebin/wt"
 }
 
 # --- spawn-world ------------------------------------------------------------

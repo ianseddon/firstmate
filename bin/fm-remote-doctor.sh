@@ -83,6 +83,9 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(CDPATH='' cd "$SCRIPT_DIR/.." && pwd -P)}"
 # is filled once the backend is resolved below, keeping the probe's six-fact
 # shape (five tools plus the at-least-one harness) for explicit and resolved
 # selections alike.
+# Remote secondmate homes use the treehouse worktree provider only: a home on the
+# worktrunk provider refuses to launch a remote secondmate (bin/fm-spawn.sh), so
+# this doctor never provisions wt.
 REQUIRED_TOOLS=()
 HARNESS_TOOLS=(claude codex opencode pi pi-signed grok kimi omp)
 OPTIONAL_TOOLS=(tmux no-mistakes gh)

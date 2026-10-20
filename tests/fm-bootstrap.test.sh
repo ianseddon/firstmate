@@ -861,6 +861,53 @@ test_treehouse_lease_check_follows_resolved_backend() {
   pass "bootstrap: the treehouse lease check follows the resolved backend's worktree provider"
 }
 
+test_worktrunk_provider_requires_wt_not_treehouse() {
+  local case_dir fakebin out
+  # Worktrunk replaces treehouse as the worktree provider: with wt present, a
+  # lease-less treehouse is irrelevant, and with wt absent bootstrap names it as
+  # a manual install rather than demanding treehouse.
+  case_dir="$TMP_ROOT/herdr-worktrunk"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' herdr > "$case_dir/home/config/backend"
+  printf '%s\n' '# worktree provider' worktrunk > "$case_dir/home/config/worktree-provider"
+  fakebin=$(make_fake_toolchain_no_tmux "$case_dir" herdr wt)
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    "$ROOT/bin/fm-bootstrap.sh")
+  [ -z "$out" ] || fail "a worktrunk home with wt present should be silent even with a lease-less treehouse, got: $out"
+
+  rm -f "$fakebin/wt" "$fakebin/treehouse"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING_MANUAL: wt (instructions: https://worktrunk.dev)" \
+    "a worktrunk home must report a missing wt with its manual install instructions"
+  assert_not_contains "$out" "treehouse" "a worktrunk home must never be told about treehouse"
+
+  rm -f "$case_dir/home/config/worktree-provider"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_WORKTREE_PROVIDER=worktrunk "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING_MANUAL: wt" "FM_WORKTREE_PROVIDER=worktrunk must select worktrunk without the file"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING: treehouse" "a home without config/worktree-provider must still default to treehouse"
+  assert_not_contains "$out" "MISSING_MANUAL: wt" "the default treehouse home must not require wt"
+  pass "bootstrap: the worktrunk provider requires wt instead of treehouse, and treehouse stays the default"
+}
+
+test_invalid_worktree_provider_is_reported() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/invalid-worktree-provider"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' bogus > "$case_dir/home/config/worktree-provider"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "WORKTREE_PROVIDER_INVALID: bogus (known: treehouse worktrunk;" \
+    "bootstrap should report an unknown worktree provider"
+  pass "bootstrap: an unknown worktree provider is reported instead of silently falling back"
+}
+
 test_fleet_sync_timeout_scales_with_origin_backed_project_count() {
   local case_dir home fakebin fake_root out
   case_dir="$TMP_ROOT/fleet-timeout-scaled"
@@ -1555,6 +1602,8 @@ test_cmux_bundled_cli_satisfies_dependency
 test_unknown_backend_reports_invalid_configuration
 test_json_backends_require_jq_not_tmux
 test_treehouse_lease_check_follows_resolved_backend
+test_worktrunk_provider_requires_wt_not_treehouse
+test_invalid_worktree_provider_is_reported
 test_fleet_sync_timeout_scales_with_origin_backed_project_count
 test_fleet_sync_timeout_floor_preserves_small_fleets
 test_fleet_sync_timeout_explicit_override_wins

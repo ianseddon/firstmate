@@ -63,10 +63,16 @@
 #   (z3d) forced secondmate + child return leaves residue    -> warning, retirement completes, exit 4
 #   (z3e) return removes the copy                            -> cannot-verify warning, exit 4
 #   (z4) scout + ignored file                                -> ignored file survives
+#
+# A task recorded with worktree_provider=worktrunk is released through wt:
+#   (wt1) landed worktrunk ship        -> wt remove --foreground, never treehouse
+#   (wt2) wt removal fails             -> REFUSE, record and worktree kept
+#   (wt3) unlanded worktrunk ship      -> REFUSE before any removal
+#   (wt4) worktrunk scout scratch      -> its scout branch is deleted too
 set -u
 
-# shellcheck source=tests/lib.sh disable=SC1091
-. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=tests/fixtures.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/fixtures.sh"
 fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
@@ -5482,6 +5488,116 @@ test_retained_sources_still_reach_the_ordinary_refusal() {
   pass "present required sources still reach the ordinary teardown refusal"
 }
 
+# Record task-x1 as created by worktrunk, give the case the shared fake wt (which
+# does the real git work), and replace treehouse with a logging stand-in so a
+# test can prove it is never reached.
+use_worktrunk() {  # <case_dir> <worktree_branch>
+  local case_dir=$1 branch=$2
+  printf '%s\n' 'worktree_provider=worktrunk' "worktree_branch=$branch" >> "$case_dir/state/task-x1.meta"
+  fm_test_fake_wt "$case_dir/fakebin"
+  : > "$case_dir/wt.log"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
+test_worktrunk_task_is_removed_through_wt_not_treehouse() {
+  local case_dir rc
+  case_dir=$(make_case wt-landed)
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' 'branch=fm/task-x1' >> "$case_dir/state/task-x1.meta"
+  use_worktrunk "$case_dir" fm/task-x1
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+
+  set +e
+  FM_FAKE_WT_LOG="$case_dir/wt.log" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "wt-landed: a landed worktrunk task should tear down"$'\n'"$(cat "$case_dir/stderr")"
+  grep -Fqx "remove --foreground --force --no-delete-branch $case_dir/wt" "$case_dir/wt.log" \
+    || fail "wt-landed: teardown did not remove the worktree through wt: $(cat "$case_dir/wt.log")"
+  [ ! -e "$case_dir/treehouse.log" ] || fail "wt-landed: teardown ran treehouse: $(cat "$case_dir/treehouse.log")"
+  assert_absent "$case_dir/wt" "wt-landed: the worktrunk worktree survived teardown"
+  ! git -C "$case_dir/project" show-ref --verify --quiet refs/heads/fm/task-x1 \
+    || fail "wt-landed: teardown left the task branch behind"
+  assert_absent "$case_dir/state/task-x1.meta" "wt-landed: teardown kept the task record"
+  pass "a worktrunk-recorded task is removed with wt remove --foreground, never treehouse return"
+}
+
+test_worktrunk_removal_failure_keeps_state_and_reports() {
+  local case_dir rc
+  case_dir=$(make_case wt-remove-fails)
+  write_meta "$case_dir" no-mistakes ship
+  use_worktrunk "$case_dir" fm/task-x1
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+
+  set +e
+  FM_FAKE_WT_LOG="$case_dir/wt.log" FM_FAKE_WT_REMOVE_FAIL=1 \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "wt-remove-fails: a failed wt removal must abort teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "worktrunk removal failed for worktree $case_dir/wt" \
+    "wt-remove-fails: the failed removal was not reported"
+  [ -d "$case_dir/wt" ] || fail "wt-remove-fails: the worktree vanished although its removal failed"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "wt-remove-fails: teardown dropped the record after a failed removal"
+  pass "a failed worktrunk removal aborts teardown, keeps the record, and reports"
+}
+
+test_worktrunk_unlanded_work_is_still_refused() {
+  local case_dir rc
+  case_dir=$(make_case wt-unlanded)
+  write_meta "$case_dir" no-mistakes ship
+  use_worktrunk "$case_dir" fm/task-x1
+  wt_commit_file "$case_dir" feature.txt hello "unpushed work"
+
+  set +e
+  FM_FAKE_WT_LOG="$case_dir/wt.log" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "wt-unlanded: unlanded worktrunk work must refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "wt-unlanded: no REFUSED line in stderr"
+  ! grep -q '^remove' "$case_dir/wt.log" || fail "wt-unlanded: teardown removed an unlanded worktree"
+  assert_grep 'hello' "$case_dir/wt/feature.txt" "wt-unlanded: the unlanded work was touched"
+  pass "a worktrunk task with unlanded work is refused before any removal"
+}
+
+test_worktrunk_scout_teardown_deletes_its_scout_branch() {
+  local case_dir rc
+  case_dir=$(make_case wt-scout)
+  write_meta "$case_dir" no-mistakes scout
+  prepare_scout_teardown "$case_dir"
+  use_worktrunk "$case_dir" scout/task-x1
+  # The scout moved off its scratch branch, which therefore outlives HEAD's.
+  git -C "$case_dir/project" branch scout/task-x1 main
+
+  set +e
+  FM_FAKE_WT_LOG="$case_dir/wt.log" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "wt-scout: a worktrunk scout should tear down"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/wt" "wt-scout: the scout worktree survived teardown"
+  ! git -C "$case_dir/project" show-ref --verify --quiet refs/heads/scout/task-x1 \
+    || fail "wt-scout: teardown left the scout scratch branch behind"
+  ! git -C "$case_dir/project" show-ref --verify --quiet refs/heads/fm/task-x1 \
+    || fail "wt-scout: teardown left the branch the scout had checked out"
+  pass "a worktrunk scout teardown deletes its scout scratch branch with the worktree"
+}
+
+test_worktrunk_task_is_removed_through_wt_not_treehouse
+test_worktrunk_removal_failure_keeps_state_and_reports
+test_worktrunk_unlanded_work_is_still_refused
+test_worktrunk_scout_teardown_deletes_its_scout_branch
 test_teardown_preserves_opencode_busy_plugin_on_pool_return
 
 # Archive coverage uses the real teardown entry point over isolated homes.

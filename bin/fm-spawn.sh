@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
+# Spawn a direct report: a crewmate in a treehouse, worktrunk, or Orca worktree, or a
 # secondmate in its isolated firstmate home.
 # Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
@@ -124,13 +124,26 @@
 #   Spawn-capable backends are the reference tmux adapter, verified herdr
 #   adapter, and experimental zellij, orca, cmux, paseo, rex, t3code, tern,
 #   and hc adapters. Orca owns both the task worktree and terminal, so ship/scout Orca
-#   spawns do not run treehouse get; cmux, paseo, rex, tern, and hc are session
-#   providers only, exactly like herdr/zellij, so they do. Auto-detected herdr
+#   spawns ignore the worktree provider; cmux, paseo, rex, tern, and hc are
+#   session providers only, exactly like herdr/zellij, so they use it. Auto-detected herdr
 #   and rex stay silent like tmux; auto-detected cmux and Herdr-app-driven hc
 #   print a loud stderr notice; zellij, orca, paseo, t3code, and tern are never
 #   auto-detected (the paseo and tern markers, like bare hc markers, leak into
 #   every descendant process). An app-detected hc also records its signal in
 #   meta's backend_detect= line.
+#   The worktree provider for a fresh ship or scout on a session-provider-only
+#   backend is FM_WORKTREE_PROVIDER, then config/worktree-provider, then
+#   treehouse (bin/fm-backend.sh fm_worktree_provider_name; docs/configuration.md
+#   "Worktree provider"); an unknown value refuses. treehouse is acquired by
+#   typing `treehouse get` into the task pane. worktrunk is acquired by spawn
+#   itself running `wt switch --create <branch> --no-cd --format json` with no
+#   terminal, under the project lock: a ship's branch is its ship branch, a
+#   scout's is scout/<task-id>; a branch that already exists, or unapproved
+#   worktrunk project hooks, refuse before any endpoint exists. A worktrunk
+#   record carries worktree_provider=worktrunk and worktree_branch=, and a fresh
+#   worktrunk spawn that fails with no surviving record removes the worktree and
+#   branch it created, or publishes a cleanup_recovery=worktrunk record when it
+#   cannot.
 #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
 #   blocked backend contract. Default tmux spawns do not write backend= to meta;
 #   absent backend= means tmux. Orca, cmux, paseo, tern, and hc do not support
@@ -325,13 +338,15 @@
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
 #   git worktree root distinct from both the spawning project and its repository's
 #   primary checkout, including when the spawning project is a linked worktree.
-#   On the backends that discover that path by reading the task pane's own cwd,
-#   the same isolation test screens every read: a pane still showing the project
-#   or the repository primary while `treehouse get` prepares the slot is waited
-#   out as a transient rather than adopted and then refused, so a home that is
-#   itself a linked worktree of the project repository still launches. A pane
-#   that never reaches an isolated worktree refuses at the end of that wait,
-#   naming the last path seen and why it was rejected.
+#   On the backends that discover that path by reading the task pane's own cwd
+#   (the treehouse provider), the same isolation test screens every read: a pane
+#   still showing the project or the repository primary while `treehouse get`
+#   prepares the slot is waited out as a transient rather than adopted and then
+#   refused, so a home that is itself a linked worktree of the project
+#   repository still launches. A pane that never reaches an isolated worktree
+#   refuses at the end of that wait, naming the last path seen and why it was
+#   rejected. The worktrunk provider reports its path synchronously, so the same
+#   isolation test runs once on that path.
 #   That placement is proven only at launch. Every ship or scout therefore
 #   receives `FM_TASK_ID=<task-id>` before launch, on the same backend-specific
 #   environment channel as GOTMPDIR, and bin/fm-test-run.sh refuses to execute the
@@ -1298,6 +1313,16 @@ spawn_remote_secondmate() {
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     return 3
   fi
+  # Remote secondmate hosts are provisioned for treehouse only
+  # (bin/fm-remote-doctor.sh), while the remote home inherits this home's
+  # config/worktree-provider, so a worktrunk home refuses rather than launching a
+  # secondmate whose crewmates could never get a worktree.
+  if [ "$(fm_worktree_provider_name)" != treehouse ]; then
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id is not supported with worktree provider '$(fm_worktree_provider_name)': remote hosts are provisioned for treehouse only (docs/configuration.md \"Worktree provider\"); use a local secondmate home instead" >&2
+    return 1
+  fi
   host=$(secondmate_registry_field "$DATA/secondmates.md" "$id" host)
   root=$(secondmate_registry_field "$DATA/secondmates.md" "$id" root)
   home=$(secondmate_registry_field "$DATA/secondmates.md" "$id" home)
@@ -1618,6 +1643,9 @@ T3CODE_CREATE_UNCERTAIN=0
 T3CODE_LAUNCH_UNCONFIRMED=0
 T3CODE_PROJECT_ID=
 T3CODE_MODEL_SELECTION=
+WORKTREE_PROVIDER=
+WORKTREE_BRANCH=
+SPAWN_WORKTRUNK_CLEANUP=0
 HERDR_PROJECTION_ABORT_CLEANUP=0
 HERDR_PROJECTION_ABORT_SESSION=
 HERDR_PROJECTION_ABORT_TASK_PANE=
@@ -1678,6 +1706,116 @@ parse_orca_worktree_result() {
     ORCA_TERMINAL=${rest#*$'\t'}
   else
     ORCA_TERMINAL=
+  fi
+}
+
+# The backend endpoint identity of a task record. backend= is written only for
+# a non-default (non-tmux) backend, so the default path's meta stays
+# byte-identical (absent backend= means tmux; data/fm-backend-design-d7's P1
+# compatibility contract). Shared by the task record and the worktrunk recovery
+# record, so both name the endpoint the same way.
+spawn_endpoint_meta_lines() {
+  [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
+  # backend_detect= records which Herdr app signal auto-selected hc, so the
+  # task record carries the reason, not just the result. Every other
+  # selection (explicit, default, or another detected backend) writes none.
+  case "$BACKEND:${FM_BACKEND_DETECT_SIGNAL:-}" in
+    hc:app-terminal) echo "backend_detect=$FM_BACKEND_DETECT_SIGNAL" ;;
+  esac
+  if [ "$BACKEND" = herdr ]; then
+    echo "herdr_session=${HERDR_SES:-}"
+    echo "herdr_workspace_id=${HERDR_WORKSPACE_ID:-}"
+    echo "herdr_tab_id=${HERDR_TAB_ID:-}"
+    echo "herdr_pane_id=${HERDR_PANE_ID:-}"
+  fi
+  if [ "$BACKEND" = zellij ]; then
+    echo "zellij_session=${ZELLIJ_SES:-}"
+    echo "zellij_tab_id=${ZELLIJ_TAB_ID:-}"
+    echo "zellij_pane_id=${ZELLIJ_PANE_ID:-}"
+  fi
+  if [ "$BACKEND" = orca ]; then
+    echo "orca_worktree_id=${ORCA_WORKTREE_ID:-}"
+    echo "terminal=${ORCA_TERMINAL:-}"
+  fi
+  if [ "$BACKEND" = cmux ]; then
+    echo "cmux_workspace_id=${CMUX_WORKSPACE_ID:-}"
+    echo "cmux_surface_id=${CMUX_SURFACE_ID:-}"
+  fi
+  if [ "$BACKEND" = paseo ]; then
+    echo "paseo_terminal_id=${FM_PASEO_TASK_TERMINAL_ID:-}"
+    echo "paseo_workspace_id=${FM_PASEO_TASK_WORKSPACE_ID:-}"
+  fi
+  if [ "$BACKEND" = rex ]; then
+    echo "rex_server=${FM_REX_TASK_SERVER:-}"
+    echo "rex_session_id=${FM_REX_TASK_SESSION_ID:-}"
+    echo "rex_window_id=${FM_REX_TASK_WINDOW_ID:-}"
+    echo "rex_block_id=${FM_REX_TASK_BLOCK_ID:-}"
+  fi
+  if [ "$BACKEND" = t3code ]; then
+    echo "t3_thread_id=${T:-}"
+    echo "t3_project_id=${T3CODE_PROJECT_ID:-}"
+  fi
+  if [ "$BACKEND" = tern ]; then
+    echo "tern_session_id=${TERN_SESSION_ID:-}"
+    echo "tern_tab_id=${TERN_TAB_ID:-}"
+    echo "tern_block_id=${TERN_BLOCK_ID:-}"
+  fi
+  if [ "$BACKEND" = hc ]; then
+    echo "hc_session=${HC_SES:-}"
+    echo "hc_terminal=${HC_TERMINAL:-}"
+  fi
+}
+
+# A fresh worktrunk spawn that fails after wt created its worktree and branch,
+# and leaves no task record behind, removes both: worktrunk has no lease that
+# lapses with the endpoint, so nothing else would ever release them. A launch
+# already delivered into an endpoint that is still open may have a worker
+# running there, and a removal that fails must never be left silently, so both
+# of those cases publish a cleanup_recovery=worktrunk record instead, which
+# bin/fm-teardown.sh <id> clears. Modeled on the Orca abort cleanup.
+spawn_worktrunk_abort_cleanup() {
+  local out="" reason
+  SPAWN_WORKTRUNK_CLEANUP=0
+  if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+    return 0
+  fi
+  if [ "$SPAWN_LAUNCH_SENT" = 1 ] && [ "$SPAWN_ENDPOINT_CLOSED" != 1 ]; then
+    reason="a launch was already delivered into endpoint ${T:-unknown}, which is still open"
+  elif [ -z "${WT:-}" ]; then
+    git -C "$PROJ_ABS" branch -D "$WORKTREE_BRANCH" >/dev/null 2>&1 && return 0
+    reason="its branch $WORKTREE_BRANCH could not be deleted"
+  else
+    if out=$(wt -C "$PROJ_ABS" remove --foreground --force --force-delete "$WT" </dev/null 2>&1) &&
+      [ ! -e "$WT" ] && ! git -C "$PROJ_ABS" show-ref --verify --quiet "refs/heads/$WORKTREE_BRANCH"; then
+      return 0
+    fi
+    [ -z "$out" ] || printf '%s\n' "$out" >&2
+    reason="wt remove did not remove the worktree and its branch"
+  fi
+  SPAWN_META_TMP="$STATE/.$ID.meta.worktrunk-recovery.${BASHPID:-$$}"
+  if mkdir -p "$STATE" 2>/dev/null &&
+    {
+      echo "window=${T:-}"
+      echo "endpoint_task_id=$ID"
+      echo "cleanup_recovery=worktrunk"
+      echo "worktree=${WT:-}"
+      echo "project=$PROJ_ABS"
+      echo "harness=${HARNESS:-}"
+      echo "kind=$KIND"
+      [ -z "${MODE:-}" ] || echo "mode=$MODE"
+      [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
+      [ -z "${BRANCH:-}" ] || echo "branch=$BRANCH"
+      echo "worktree_provider=worktrunk"
+      echo "worktree_branch=$WORKTREE_BRANCH"
+      echo "tasktmp=${TASK_TMP:-}"
+      echo "model=${MODEL:-default}"
+      echo "effort=${EFFORT:-default}"
+      spawn_endpoint_meta_lines
+    } >"$SPAWN_META_TMP" 2>/dev/null &&
+    fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE"; then
+    echo "warning: the worktrunk worktree ${WT:-unknown} (branch $WORKTREE_BRANCH) of failed spawn $ID was kept because $reason; a cleanup_recovery record now names it - run bin/fm-teardown.sh $ID to release it" >&2
+  else
+    echo "warning: the worktrunk worktree ${WT:-unknown} (branch $WORKTREE_BRANCH) of failed spawn $ID was kept because $reason, and no recovery record could be written; remove it by hand: wt -C $PROJ_ABS remove --foreground --force --force-delete ${WT:-$WORKTREE_BRANCH}" >&2
   fi
 }
 
@@ -1893,6 +2031,9 @@ spawn_abort_cleanup() {
         echo "warning: another spawn of $ID holds its spawn lock; leaving its $HARNESS wiring, temp root, and staged launch file in place" >&2
       fi
     fi
+  fi
+  if [ "$status" -ne 0 ] && [ "$SPAWN_WORKTRUNK_CLEANUP" = 1 ]; then
+    spawn_worktrunk_abort_cleanup
   fi
   # A spawn that aborts after claiming its slot but before its record survives
   # must not leave a claim naming a task no record describes. The release is a
@@ -2331,6 +2472,38 @@ if [ "$RELAUNCH" -eq 0 ]; then
         "$ORCA_LAUNCH_ENV_SESSION" "$LAUNCH_ENV_NAMES") || exit 1
     elif [ -n "$LAUNCH_ENV_NAMES" ]; then
       echo "warning: backend=orca resolves config/launch-env-allowlist names from the Orca terminal's own environment, not this home's; set config/launch-env-tmux-session to take them from a scoped tmux session" >&2
+    fi
+  fi
+  # Worktree provider (docs/configuration.md "Worktree provider"): resolved once
+  # for a fresh ship or scout on a session-provider-only backend, and recorded as
+  # worktree_provider= when it is not the default treehouse, so teardown and
+  # relaunch follow the provider that created the worktree rather than the
+  # current setting. Orca owns its own worktree and ignores the setting. Worktrunk
+  # needs a branch at creation: a ship gets its computed ship branch, a scout a
+  # scout-scoped scratch branch that teardown deletes.
+  if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+    WORKTREE_PROVIDER=$(fm_worktree_provider_name)
+    fm_worktree_provider_validate "$WORKTREE_PROVIDER" || exit 1
+    if [ "$WORKTREE_PROVIDER" = worktrunk ] && [ "$BACKEND" = t3code ]; then
+      echo "error: backend=t3code leases its own treehouse slot and cannot use worktree provider worktrunk; choose another backend or provider" >&2
+      exit 1
+    fi
+    if [ "$WORKTREE_PROVIDER" = worktrunk ]; then
+      for spawn_wt_tool in wt jq; do
+        command -v "$spawn_wt_tool" >/dev/null 2>&1 || {
+          echo "error: worktree provider worktrunk requires $spawn_wt_tool on PATH (wt: https://worktrunk.dev); refusing to spawn $ID" >&2
+          exit 1
+        }
+      done
+      if [ "$KIND" = ship ]; then
+        WORKTREE_BRANCH=$BRANCH
+      else
+        WORKTREE_BRANCH="scout/$ID"
+      fi
+      git check-ref-format --branch "$WORKTREE_BRANCH" >/dev/null 2>&1 || {
+        echo "error: task $ID cannot form a valid worktrunk branch (got '$WORKTREE_BRANCH')" >&2
+        exit 1
+      }
     fi
   fi
 fi
@@ -4069,6 +4242,87 @@ if [ -n "$SPAWN_PROJECT_CAPACITY" ]; then
     exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
   fi
 fi
+# Worktrunk acquisition (docs/configuration.md "Worktree provider"). Firstmate
+# runs `wt` itself as a subprocess with no terminal (stdin is /dev/null), under
+# the project lock taken above, instead of typing a command into the pane:
+# `wt switch --create <branch> --no-cd --format json` creates the worktree and
+# its branch synchronously and reports the path, and spawn_enter_recorded_worktree
+# moves the pane there afterwards. The endpoint is still opened at the project
+# clone, never through `herdr worktree`, so no worktree-event automation fires.
+# wt runs every configured hook, and project hooks need the captain's approval:
+# verified against wt 0.80 (b49ca7e), a run with no terminal and an unapproved
+# project hook fails before creating anything ("Cannot prompt for approval in
+# non-interactive environment"), so the preflight refuses first with the
+# remedy instead of ever passing --yes for repo-controlled commands.
+spawn_worktrunk_preflight() {
+  local approvals state
+  if git -C "$PROJ_ABS" show-ref --verify --quiet "refs/heads/$WORKTREE_BRANCH"; then
+    echo "error: spawn refused: branch $WORKTREE_BRANCH already exists in $PROJ_ABS; a stale task branch is never adopted. Inspect it, then delete it (git -C $(shell_quote "$PROJ_ABS") branch -D $(shell_quote "$WORKTREE_BRANCH")) or spawn under another task id" >&2
+    return 1
+  fi
+  approvals=$(wt -C "$PROJ_ABS" config approvals list --format json </dev/null) || {
+    echo "error: spawn refused: could not read worktrunk hook approvals for $PROJ_ABS (wt config approvals list)" >&2
+    return 1
+  }
+  state=$(printf '%s\n' "$approvals" | jq -r '.state // empty' 2>/dev/null) || state=
+  case "$state" in
+    no_commands | approved) return 0 ;;
+    approval_required)
+      echo "error: spawn refused: $PROJ_ABS declares worktrunk project hooks that are not approved, and wt cannot ask for approval without a terminal; review and approve them with: wt -C $(shell_quote "$PROJ_ABS") config approvals add" >&2
+      ;;
+    *)
+      echo "error: spawn refused: wt reported an unrecognized hook approval state '${state:-none}' for $PROJ_ABS" >&2
+      ;;
+  esac
+  return 1
+}
+
+# The linked worktree that has <branch> checked out, from git's own registry.
+spawn_worktree_of_branch() { # <project> <branch>
+  git -C "$1" worktree list --porcelain 2>/dev/null | awk -v ref="branch refs/heads/$2" '
+    /^worktree / { path = substr($0, 10) }
+    $0 == ref { print path; exit }
+  '
+}
+
+spawn_worktrunk_acquire() {
+  local base out rc=0 path action
+  spawn_resolve_origin_base "$PROJ_ABS" "$BASE_BRANCH" "project '$PROJ_ABS'" || return 1
+  base=$SPAWN_ORIGIN_BASE
+  # An origin-less project branches from its own current commit.
+  [ -n "$base" ] || base=$(git -C "$PROJ_ABS" rev-parse --verify --quiet 'HEAD^{commit}') || {
+    echo "error: could not resolve the commit to branch $WORKTREE_BRANCH from in $PROJ_ABS" >&2
+    return 1
+  }
+  if git -C "$PROJ_ABS" show-ref --verify --quiet "refs/heads/$WORKTREE_BRANCH"; then
+    echo "error: spawn refused: branch $WORKTREE_BRANCH appeared in $PROJ_ABS before wt could create it; a stale task branch is never adopted" >&2
+    return 1
+  fi
+  out=$(wt -C "$PROJ_ABS" switch --create "$WORKTREE_BRANCH" --base "$base" --no-cd --format json </dev/null) || rc=$?
+  # The branch did not exist under this lock a moment ago, so if it exists now
+  # this spawn created it - even when wt then failed (a failing pre-start hook
+  # leaves both the worktree and the branch behind) - and the abort path owns
+  # removing both.
+  if git -C "$PROJ_ABS" show-ref --verify --quiet "refs/heads/$WORKTREE_BRANCH"; then
+    SPAWN_WORKTRUNK_CLEANUP=1
+    WT=$(spawn_worktree_of_branch "$PROJ_ABS" "$WORKTREE_BRANCH")
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "error: wt switch --create $WORKTREE_BRANCH failed (exit $rc) in $PROJ_ABS; its own error is above" >&2
+    return 1
+  fi
+  action=$(printf '%s\n' "$out" | jq -r '.action // empty' 2>/dev/null) || action=
+  path=$(printf '%s\n' "$out" | jq -r '.path // empty' 2>/dev/null) || path=
+  if [ "$action" != created ] || [ -z "$path" ]; then
+    echo "error: wt switch --create $WORKTREE_BRANCH did not report a created worktree (got: $out)" >&2
+    return 1
+  fi
+  WT=$path
+}
+
+if [ "$RELAUNCH" -eq 0 ] && [ "$WORKTREE_PROVIDER" = worktrunk ]; then
+  spawn_worktrunk_preflight || exit 1
+fi
 [ -f "$BRIEF" ] || {
   echo "error: task $ID has no brief at inaccessible data path $BRIEF" >&2
   exit 1
@@ -4524,50 +4778,76 @@ spawn_base_from_primary_checkout() { # <worktree> <project> <default> <origin-re
   return 1
 }
 
-freshen_spawn_worktree_base() { # <worktree> <base-branch> <project> <mode>; 2 when the worktree is not clean
-  local worktree=$1 base=${2:-} project=${3:-} mode=${4:-} default target expected reset_ref actual status
-  status=$(git -C "$worktree" -c core.quotePath=false status --porcelain) || {
-    echo "error: could not inspect pooled worktree '$worktree' before refreshing its base" >&2
-    return 1
-  }
-  if [ -n "$status" ]; then
-    if describe_stale_submodule_pins "$worktree" "$status"; then
-      echo "error: pooled worktree '$worktree' has a stale submodule checkout, not uncommitted work; refusing to launch and leaving it untouched" >&2
-    else
-      echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
-    fi
-    return 2
-  fi
-  if ! spawn_worktree_has_origin_config "$worktree"; then
+# The worktree a fresh ship or scout launches in is named after its provider in
+# every refusal below, so an operator knows which tool produced it.
+spawn_worktree_noun() {
+  case "$WORKTREE_PROVIDER" in
+    worktrunk) printf 'worktrunk worktree' ;;
+    *) printf 'pooled worktree' ;;
+  esac
+}
+
+# spawn_resolve_origin_base <dir> <base-branch> <label>: the fresh-base contract
+# every provider shares. Fetches origin from <dir>, resolves the base (the
+# explicit --base-branch, else origin's current default branch), fetches that
+# branch, and sets SPAWN_ORIGIN_BASE to origin/<branch>. A <dir> with no origin
+# leaves it empty and succeeds, so an origin-less project launches as-is, unless
+# an explicit base was asked for. <label> names <dir> in every refusal.
+SPAWN_ORIGIN_BASE=
+spawn_resolve_origin_base() {
+  local dir=$1 base=$2 label=$3 default
+  SPAWN_ORIGIN_BASE=
+  if ! spawn_worktree_has_origin_config "$dir"; then
     [ -z "$base" ] || {
-      echo "error: pooled worktree '$worktree' has no origin, so it cannot start from base branch '$base'" >&2
+      echo "error: $label has no origin, so it cannot start from base branch '$base'" >&2
       return 1
     }
     return 0
   fi
-  if ! git -C "$worktree" fetch --quiet origin; then
-    echo "error: could not fetch origin for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
+  if ! git -C "$dir" fetch --quiet origin; then
+    echo "error: could not fetch origin for $label; refusing to launch from a potentially stale base" >&2
     return 1
   fi
   if [ -n "$base" ]; then
     default=$base
   else
-    if ! git -C "$worktree" remote set-head origin --auto >/dev/null 2>&1; then
-      echo "error: could not resolve origin's current default branch for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
+    if ! git -C "$dir" remote set-head origin --auto >/dev/null 2>&1; then
+      echo "error: could not resolve origin's current default branch for $label; refusing to launch from a potentially stale base" >&2
       return 1
     fi
-    default=$(default_branch "$worktree") || {
-      echo "error: could not determine origin's default branch for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
+    default=$(default_branch "$dir") || {
+      echo "error: could not determine origin's default branch for $label; refusing to launch from a potentially stale base" >&2
       return 1
     }
   fi
-  target="origin/$default"
-  if ! git -C "$worktree" fetch --quiet origin "+refs/heads/$default:refs/remotes/origin/$default"; then
-    echo "error: could not fetch '$target' for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
+  if ! git -C "$dir" fetch --quiet origin "+refs/heads/$default:refs/remotes/origin/$default"; then
+    echo "error: could not fetch 'origin/$default' for $label; refusing to launch from a potentially stale base" >&2
     return 1
   fi
+  SPAWN_ORIGIN_BASE="origin/$default"
+}
+
+freshen_spawn_worktree_base() { # <worktree> <base-branch> <project> <mode>; 2 when the worktree is not clean
+  local worktree=$1 base=${2:-} project=${3:-} mode=${4:-} label default target expected reset_ref actual status
+  label="$(spawn_worktree_noun) '$worktree'"
+  status=$(git -C "$worktree" -c core.quotePath=false status --porcelain) || {
+    echo "error: could not inspect $label before refreshing its base" >&2
+    return 1
+  }
+  if [ -n "$status" ]; then
+    if describe_stale_submodule_pins "$worktree" "$status"; then
+      echo "error: $label has a stale submodule checkout, not uncommitted work; refusing to launch and leaving it untouched" >&2
+    else
+      echo "error: $label is not clean; refusing to discard uncommitted work while refreshing its base" >&2
+    fi
+    return 2
+  fi
+  spawn_resolve_origin_base "$worktree" "$base" "$label" || return 1
+  target=$SPAWN_ORIGIN_BASE
+  [ -n "$target" ] || return 0
+  default=${target#origin/}
   expected=$(git -C "$worktree" rev-parse --verify --quiet "$target^{commit}" 2>/dev/null) || {
-    echo "error: '$target' is not a commit for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
+    echo "error: '$target' is not a commit for $label; refusing to launch from a potentially stale base" >&2
     return 1
   }
   reset_ref=$target
@@ -4578,12 +4858,12 @@ freshen_spawn_worktree_base() { # <worktree> <base-branch> <project> <mode>; 2 w
     reset_ref=$expected
   fi
   if ! git -C "$worktree" reset --hard "$reset_ref" >/dev/null; then
-    echo "error: could not reset pooled worktree '$worktree' to '$target'; refusing to launch from a potentially stale base" >&2
+    echo "error: could not reset $label to '$target'; refusing to launch from a potentially stale base" >&2
     return 1
   fi
   actual=$(git -C "$worktree" rev-parse --verify --quiet HEAD 2>/dev/null || true)
   if [ "$actual" != "$expected" ]; then
-    echo "error: pooled worktree '$worktree' is at '${actual:-unknown}', not current '$target' ('$expected'); refusing to launch" >&2
+    echo "error: $label is at '${actual:-unknown}', not current '$target' ('$expected'); refusing to launch" >&2
     return 1
   fi
 }
@@ -5821,6 +6101,9 @@ elif [ "$RELAUNCH" -eq 1 ]; then
     fi
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
+elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$WORKTREE_PROVIDER" = worktrunk ]; then
+  spawn_worktrunk_acquire || exit 1
+  validate_spawn_worktree "wt switch --create" "$WT ($(spawn_endpoint_hint))"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # A t3code slot was leased and validated in its target branch above.
   if [ "$BACKEND" != t3code ]; then
@@ -7041,6 +7324,13 @@ preserve_relaunch_meta() {
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
   [ -z "${BRANCH:-}" ] || echo "branch=$BRANCH"
+  # worktree_provider= is written only for a non-default provider, so a
+  # treehouse record stays byte-identical; a relaunch carries both keys through
+  # preserve_relaunch_meta, never re-resolving the current setting.
+  if [ "$RELAUNCH" -eq 0 ] && [ "$WORKTREE_PROVIDER" = worktrunk ]; then
+    echo "worktree_provider=worktrunk"
+    echo "worktree_branch=$WORKTREE_BRANCH"
+  fi
   echo "tasktmp=$TASK_TMP"
   [ -z "$BASE_BRANCH" ] || echo "base_branch=$BASE_BRANCH"
   [ -z "$UPSTREAM_CONSENT" ] || echo "upstream_consent=$UPSTREAM_CONSENT"
@@ -7064,58 +7354,7 @@ preserve_relaunch_meta() {
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
-  # backend= is written only for a non-default (non-tmux) backend, so the
-  # default path's meta stays byte-identical (absent backend= means tmux;
-  # data/fm-backend-design-d7's P1 compatibility contract).
-  [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
-  # backend_detect= records which Herdr app signal auto-selected hc, so the
-  # task record carries the reason, not just the result. Every other
-  # selection (explicit, default, or another detected backend) writes none.
-  case "$BACKEND:${FM_BACKEND_DETECT_SIGNAL:-}" in
-    hc:app-terminal) echo "backend_detect=$FM_BACKEND_DETECT_SIGNAL" ;;
-  esac
-  if [ "$BACKEND" = herdr ]; then
-    echo "herdr_session=$HERDR_SES"
-    echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
-    echo "herdr_tab_id=$HERDR_TAB_ID"
-    echo "herdr_pane_id=$HERDR_PANE_ID"
-  fi
-  if [ "$BACKEND" = zellij ]; then
-    echo "zellij_session=$ZELLIJ_SES"
-    echo "zellij_tab_id=$ZELLIJ_TAB_ID"
-    echo "zellij_pane_id=$ZELLIJ_PANE_ID"
-  fi
-  if [ "$BACKEND" = orca ]; then
-    echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-    echo "terminal=$ORCA_TERMINAL"
-  fi
-  if [ "$BACKEND" = cmux ]; then
-    echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
-    echo "cmux_surface_id=$CMUX_SURFACE_ID"
-  fi
-  if [ "$BACKEND" = paseo ]; then
-    echo "paseo_terminal_id=$FM_PASEO_TASK_TERMINAL_ID"
-    echo "paseo_workspace_id=$FM_PASEO_TASK_WORKSPACE_ID"
-  fi
-  if [ "$BACKEND" = rex ]; then
-    echo "rex_server=$FM_REX_TASK_SERVER"
-    echo "rex_session_id=$FM_REX_TASK_SESSION_ID"
-    echo "rex_window_id=$FM_REX_TASK_WINDOW_ID"
-    echo "rex_block_id=$FM_REX_TASK_BLOCK_ID"
-  fi
-  if [ "$BACKEND" = t3code ]; then
-    echo "t3_thread_id=$T"
-    echo "t3_project_id=$T3CODE_PROJECT_ID"
-  fi
-  if [ "$BACKEND" = tern ]; then
-    echo "tern_session_id=$TERN_SESSION_ID"
-    echo "tern_tab_id=$TERN_TAB_ID"
-    echo "tern_block_id=$TERN_BLOCK_ID"
-  fi
-  if [ "$BACKEND" = hc ]; then
-    echo "hc_session=$HC_SES"
-    echo "hc_terminal=$HC_TERMINAL"
-  fi
+  spawn_endpoint_meta_lines
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"

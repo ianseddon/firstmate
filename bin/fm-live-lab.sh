@@ -40,9 +40,12 @@
 #                    in a lab), started from an empty environment so no inherited
 #                    TMUX, Herdr, or Pi marker reaches a lab process.
 #                    TREEHOUSE_ROOT points into <lab-root>, so a worker's pool
-#                    never lands in ~/.treehouse, and DISABLE_AUTOUPDATER=1
-#                    keeps Claude Code from replacing the shared binary under
-#                    a running lab, as every live run does (tests/lib.sh).
+#                    never lands in ~/.treehouse, FM_WORKTREE_PROVIDER=treehouse
+#                    keeps the lab on the only worktree provider it isolates
+#                    even when the operator's home uses worktrunk, and
+#                    DISABLE_AUTOUPDATER=1 keeps Claude Code from replacing the
+#                    shared binary under a running lab, as every live run does
+#                    (tests/lib.sh).
 #                    A set CLAUDE_CONFIG_DIR (absolute) is passed to every lab
 #                    process. up records the Claude store, Pi trust store, and
 #                    ~/.treehouse it selected, so check and down use those same
@@ -168,7 +171,7 @@ lab_tmux() {
 lab_env_base() {
   printf '%s\n' "HOME=$HOME" "USER=${USER:-$(id -un)}" "LOGNAME=${USER:-$(id -un)}" \
     "PATH=$PATH" "SHELL=${SHELL:-/bin/zsh}" "TERM=xterm-256color" "LANG=${LANG:-en_US.UTF-8}" \
-    "TMUX_TMPDIR=$TMUX_DIR" "TREEHOUSE_ROOT=$ROOT/treehouse" "FM_BACKEND=tmux" "DISABLE_AUTOUPDATER=1"
+    "TMUX_TMPDIR=$TMUX_DIR" "TREEHOUSE_ROOT=$ROOT/treehouse" "FM_BACKEND=tmux" "FM_WORKTREE_PROVIDER=treehouse" "DISABLE_AUTOUPDATER=1"
   [ -z "${CLAUDE_DIR:-}" ] || printf '%s\n' "CLAUDE_CONFIG_DIR=$CLAUDE_DIR"
 }
 

@@ -87,6 +87,7 @@
 # Before that return, teardown runs `git clean -ffdq` in the copy, and a forced
 # secondmate teardown does the same in each child copy it returns.
 # The second -f removes nested repositories, and -x stays off so ignored files remain.
+# A worktrunk copy is deleted outright by its removal, so it is never scrubbed.
 # A ship teardown without --force does not run that clean: it refuses untracked
 # entries, except those under the .claude/ allowance, so a nested repository
 # there can still survive the return.
@@ -233,14 +234,31 @@
 #   spawn_gen, a non-tmux backend, or an ambiguous field, still faces the
 #   validator and refuses.
 #
+# Worktree release follows the provider recorded in the task's meta
+# (worktree_provider=; absent means treehouse), never the home's current
+# config/worktree-provider: treehouse tasks run `treehouse return --force`, and
+# worktrunk tasks run `wt -C <project> remove --foreground --force
+# --no-delete-branch <worktree>` with no terminal, after the same provider-agnostic
+# landed and dirty checks and the same branch deletion. A worktrunk scout's
+# scratch branch (worktree_branch=, scout/<task-id>) is deleted too when the
+# worker left it behind. Removal hooks the captain has not approved make wt fail,
+# and teardown then keeps every record and reports, like any other release
+# failure. A cleanup_recovery= record (a failed Orca or worktrunk spawn that
+# could not clean up after itself) is not a launched backlog worker, so its
+# teardown releases what it names without touching the backlog.
+#
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crew process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
 # non-linked worktree, .git/index.lock) that makes `treehouse return --force` fail
 # with Unable to create '...index.lock': File exists. That lock is usually transient
 # (the dying process finishes or exits within seconds) and must never be force-deleted
 # while a live git process might still own it - the fix is patience, not rm.
+# Verified against wt 0.80 (b49ca7e): a forced `wt remove` succeeded with a live
+# index.lock in both the worktree's and the repository's git dir, so this ladder is
+# a treehouse concern in practice; it keys on git's own error text, so a worktrunk
+# removal that ever surfaces it gets the same treatment.
 #
-# On that failure signature only, teardown_treehouse_return:
+# On that failure signature only, teardown_release_worktree:
 #   1. Retries up to FM_TREEHOUSE_RETURN_LOCK_RETRIES times (default 3), waiting
 #      FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS (default 1s; falls back to the older
 #      FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS name when the new one is unset) between
@@ -711,7 +729,7 @@ case "$TEARDOWN_WINDOW_COUNT:$(fm_meta_get "$META" window)" in
     esac
     ;;
 esac
-if [ "$TEARDOWN_CLEANUP_RECOVERY" != orca ]; then
+if [ -z "$TEARDOWN_CLEANUP_RECOVERY" ]; then
   if fm_backlog_transition_applies "$CONFIG" "$DATA" "$TEARDOWN_META_KIND"; then
     TEARDOWN_BACKLOG_APPLIES=1
   else
@@ -1297,6 +1315,15 @@ fi
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 CLEANUP_RECOVERY=$TEARDOWN_CLEANUP_RECOVERY
+# The provider that created this task's worktree is the recorded one, never the
+# home's current config/worktree-provider; an absent key means treehouse.
+WORKTREE_PROVIDER=$(fm_worktree_provider_of_meta "$META")
+WORKTREE_BRANCH=$(fm_meta_get "$META" worktree_branch)
+if [ "$WORKTREE_PROVIDER" = worktrunk ] && [ "$TEARDOWN_META_KIND" != secondmate ] \
+   && [ -d "$WT" ] && ! command -v wt >/dev/null 2>&1; then
+  echo "REFUSED: task $ID's worktree $WT was created by worktrunk, but wt is not on PATH to remove it; nothing was changed" >&2
+  exit 1
+fi
 
 KIND=$TEARDOWN_META_KIND
 TEARDOWN_POOL_SLOT_LOST=0
@@ -1825,7 +1852,7 @@ backlog_done_args() {
 backlog_refresh_reminder() {
   local backlog_display root backend=markdown
   [ "$KIND" = secondmate ] && return 0
-  [ "$CLEANUP_RECOVERY" = orca ] && return 0
+  [ -z "$CLEANUP_RECOVERY" ] || return 0
   if root=$(fm_backlog_root "$DATA"); then
     backend=$(fm_tasks_axi_backend "$root") || return 2
   fi
@@ -1981,15 +2008,30 @@ cleanup_stale_lock_for_safety_check() {
   return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
 }
 
-# Return a worktree/home via `treehouse return --force`, tolerating a transient or
-# stale git index.lock left by a killed crew process. See the script header.
-teardown_treehouse_return() {
-  local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
-  local out lock attempt=0 max_retries lock_desc
+# Run the recorded worktree provider's release of <dir> once, from <cd_dir>:
+# `treehouse return --force` resolves its pool from the working directory, and
+# worktrunk removes the worktree in the foreground with no terminal, keeping the
+# branch (teardown already deleted it after its own landed-work checks) and
+# running the captain's approved remove hooks.
+teardown_release_command() {  # <provider> <dir> <cd_dir>
+  case "$1" in
+    worktrunk) wt -C "$3" remove --foreground --force --no-delete-branch "$2" </dev/null ;;
+    *) ( cd "$3" && treehouse return --force "$2" ) ;;
+  esac
+}
+
+# Release a worktree/home through its recorded provider (treehouse return, or a
+# worktrunk removal), tolerating a transient or stale git index.lock left by a
+# killed crew process. Both providers surface git's own lock error, so the same
+# signature drives the retry. See the script header.
+teardown_release_worktree() {  # <provider> <dir> <cd_dir> <label> [<post-cleanup-check>]
+  local provider=$1 dir=$2 cd_dir=$3 label=$4 post_cleanup_check=${5:-}
+  local out lock attempt=0 max_retries lock_desc verb=return
+  [ "$provider" != worktrunk ] || verb=removal
 
   # Capture stdout+stderr so non-lock failures stay visible and lock failures can
   # be matched by signature even when the lock file is already gone mid-check.
-  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+  if out=$(teardown_release_command "$provider" "$dir" "$cd_dir" 2>&1); then
     [ -n "$out" ] && printf '%s\n' "$out"
     return 0
   fi
@@ -2011,18 +2053,18 @@ teardown_treehouse_return() {
 
   while [ "$attempt" -lt "$max_retries" ]; do
     attempt=$(( attempt + 1 ))
-    echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
+    echo "teardown: $label $verb failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
     sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
 
-    if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    if out=$(teardown_release_command "$provider" "$dir" "$cd_dir" 2>&1); then
       [ -n "$out" ] && printf '%s\n' "$out"
-      echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
+      echo "teardown: $label $verb succeeded on retry; lock cleared on its own" >&2
       return 0
     fi
     [ -n "$out" ] && printf '%s\n' "$out" >&2
 
     if ! treehouse_return_is_index_lock_error "$out"; then
-      echo "teardown: $label return failed with a non-lock error after retry; aborting" >&2
+      echo "teardown: $label $verb failed with a non-lock error after retry; aborting" >&2
       return 1
     fi
   done
@@ -2034,28 +2076,28 @@ teardown_treehouse_return() {
     lock_desc=$lock
     if fm_lock_is_provably_stale "$lock" "$dir" "$STALE_WORKTREE_LOCK_AGE_SECS"; then
       rm -f "$lock"
-      echo "teardown: removed provably-stale git lock $lock (age >= ${STALE_WORKTREE_LOCK_AGE_SECS}s, no live holder) and retrying $label return" >&2
+      echo "teardown: removed provably-stale git lock $lock (age >= ${STALE_WORKTREE_LOCK_AGE_SECS}s, no live holder) and retrying $label $verb" >&2
       if [ -n "$post_cleanup_check" ]; then
         if ! "$post_cleanup_check"; then
-          echo "teardown: $label return aborted after stale-lock cleanup because safety checks failed" >&2
+          echo "teardown: $label $verb aborted after stale-lock cleanup because safety checks failed" >&2
           return 1
         fi
       fi
-      if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+      if out=$(teardown_release_command "$provider" "$dir" "$cd_dir" 2>&1); then
         [ -n "$out" ] && printf '%s\n' "$out"
-        echo "teardown: $label return succeeded after stale-lock cleanup" >&2
+        echo "teardown: $label $verb succeeded after stale-lock cleanup" >&2
         return 0
       fi
       [ -n "$out" ] && printf '%s\n' "$out" >&2
-      echo "teardown: $label return still failing after stale-lock cleanup" >&2
+      echo "teardown: $label $verb still failing after stale-lock cleanup" >&2
       return 1
     fi
 
-    echo "teardown: $label return failed: git lock $lock_desc persisted across ${max_retries} retries (waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s each) and is not provably stale (may belong to a live process); leaving it in place" >&2
+    echo "teardown: $label $verb failed: git lock $lock_desc persisted across ${max_retries} retries (waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s each) and is not provably stale (may belong to a live process); leaving it in place" >&2
     return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
   fi
 
-  echo "teardown: $label return failed: git index.lock signature persisted across ${max_retries} retries (waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s each) even after the lock file disappeared" >&2
+  echo "teardown: $label $verb failed: git index.lock signature persisted across ${max_retries} retries (waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s each) even after the lock file disappeared" >&2
   return 1
 }
 
@@ -2905,7 +2947,7 @@ remove_firstmate_home() {  # <home> <label> <task-id> <backend>
       restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
       return 1
     }
-    teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" || {
+    teardown_release_worktree treehouse "$abs_home_path" "$FM_ROOT" "$label" || {
       echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
       restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
       return 1
@@ -3445,7 +3487,7 @@ endpoint_close_refusal() {  # <subject> <backend> <target> <honors-force>
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 archive_parent=${2:-$ID} sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_rex_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_owner_rc child_pool_slot
+  local home=$1 archive_parent=${2:-$ID} sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_rex_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_owner_rc child_pool_slot child_provider
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -3536,11 +3578,13 @@ cleanup_firstmate_home_children() {
           git -C "$child_wt" ls-files --error-unmatch CLAUDE.local.md >/dev/null 2>&1 \
             || rm -f "$child_wt/CLAUDE.local.md"
         fi
-        if [ -n "$child_proj" ] && [ -d "$child_proj" ] && command -v treehouse >/dev/null 2>&1; then
-          teardown_scrub_scratch_copy "$child_wt" || return 1
+        child_provider=$(fm_worktree_provider_of_meta "$child_meta")
+        if [ -n "$child_proj" ] && [ -d "$child_proj" ] \
+           && command -v "$(fm_worktree_provider_tool "$child_provider")" >/dev/null 2>&1; then
+          [ "$child_provider" = worktrunk ] || teardown_scrub_scratch_copy "$child_wt" || return 1
           child_pool_slot=0
           fm_treehouse_pool_slot "$child_proj" "$child_wt" && child_pool_slot=1
-          if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree"; then
+          if teardown_release_worktree "$child_provider" "$child_wt" "$child_proj" "child worktree"; then
             [ "$child_pool_slot" = 0 ] || teardown_note_dirty_return "$child_wt"
             fm_treehouse_slot_owner_release "$child_wt" "$child_id"
           else
@@ -3812,8 +3856,8 @@ teardown_legacy_stamp_rollback() {
     exit 1
   fi
 else
-  if [ "$CLEANUP_RECOVERY" = orca ]; then
-    BACKLOG_SKIP_REASON="Orca cleanup recovery is not a launched backlog worker"
+  if [ -n "$CLEANUP_RECOVERY" ]; then
+    BACKLOG_SKIP_REASON="$CLEANUP_RECOVERY cleanup recovery is not a launched backlog worker"
   else
     BACKLOG_SKIP_REASON=$TEARDOWN_BACKLOG_SKIP_REASON
   fi
@@ -3890,6 +3934,13 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
       git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
     fi
   fi
+  # A worktrunk scout's scratch branch, or a promoted scout's original one, is
+  # firstmate's own: delete it too when the worker left it behind.
+  if [ "$WORKTREE_PROVIDER" = worktrunk ] && [ -n "$WORKTREE_BRANCH" ] \
+     && [ "$WORKTREE_BRANCH" != "$(fm_meta_get "$META" branch)" ] \
+     && git -C "$WT" show-ref --verify --quiet "refs/heads/$WORKTREE_BRANCH"; then
+    git -C "$WT" branch -D "$WORKTREE_BRANCH" >/dev/null 2>&1 || true
+  fi
   # Remove our hook and environment files so a reused pool worktree cannot fire
   # signals for a dead task or hand a t3code env block or channel statement to
   # its next holder.
@@ -3900,21 +3951,27 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     "$SCRIPT_DIR/fm-t3code-codex-env.sh" cleanup "$WT" || exit 1
     git -C "$WT" ls-files --error-unmatch CLAUDE.local.md >/dev/null 2>&1 || rm -f "$WT/CLAUDE.local.md"
   fi
-  # Kills remaining processes in the worktree (including the agent), resets, returns
-  # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project. teardown_treehouse_return tolerates transient and stale git locks
+  # Kills remaining processes in the worktree (including the agent), then
+  # releases it through its recorded provider, run from the project: treehouse
+  # resets and returns it to the pool it resolves from that directory, worktrunk
+  # removes it. teardown_release_worktree tolerates transient and stale git locks
   # left by a killed crew process; see the script header for retry and stale-lock proof.
   post_lock_cleanup_check=
   if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
   fi
-  if [ "$KIND" = scout ] || [ "$FORCE" = "--force" ]; then
+  # Only a treehouse copy survives its release, so only it needs the scrub.
+  if [ "$WORKTREE_PROVIDER" != worktrunk ] && { [ "$KIND" = scout ] || [ "$FORCE" = "--force" ]; }; then
     teardown_scrub_scratch_copy "$WT" || exit 1
   fi
   wt_pool_slot=0
   fm_treehouse_pool_slot "$PROJ" "$WT" && wt_pool_slot=1
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+  teardown_release_worktree "$WORKTREE_PROVIDER" "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
+    if [ "$WORKTREE_PROVIDER" = worktrunk ]; then
+      echo "error: worktrunk removal failed for worktree $WT; teardown aborted" >&2
+    else
+      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+    fi
     exit 1
   }
   [ "$wt_pool_slot" = 0 ] || teardown_note_dirty_return "$WT"

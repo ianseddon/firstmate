@@ -462,6 +462,30 @@ STUB
   pass "fm-promote: a promoted worker receives the same mode-specific delivery contract a briefed one does"
 }
 
+test_worktrunk_promotion_keeps_the_scout_branch_for_teardown() {
+  local home id meta instructions
+  home="$TMP_ROOT/promote-worktrunk/home"
+  id=promote-worktrunk-e1
+  meta="$home/state/$id.meta"
+  mkdir -p "$home/state"
+  printf 'window=fm-%s\nkind=scout\nworktree=/tmp/wt\nworktree_provider=worktrunk\nworktree_branch=scout/%s\n' "$id" "$id" > "$meta"
+  FM_HOME="$home" "$BRIEF" "$id" fixture-project --scout >/dev/null 2>&1 \
+    || fail "worktrunk promotion scout brief should scaffold"
+  fill_brief_subsections "$home/data/$id/brief.md" \
+    "Promote the worktrunk fixture." "Ship from the scout's worktree."
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$PROMOTE" "$id" \
+    --mode local-only --yolo off --branch-prefix feat/ >/dev/null \
+    || fail "worktrunk promotion should succeed"
+  instructions="$home/data/$id/ship-instructions.md"
+  assert_grep "git checkout -b feat/$id --" "$instructions" \
+    "a worktrunk promotion did not create the new ship branch"
+  assert_grep "Leave the scout scratch branch \`scout/$id\` where it is; firstmate created it and deletes it at cleanup." "$instructions" \
+    "a worktrunk promotion did not account for the scout branch worktrunk created"
+  assert_grep 'a worktrunk worktree' "$instructions" \
+    "a worktrunk promotion's isolation step did not name a worktrunk worktree"
+  pass "fm-promote: a worktrunk scout's promotion creates the ship branch and leaves its scout branch for teardown"
+}
+
 test_promotion_persists_the_selected_ship_branch() {
   local home id meta instructions out
   home="$TMP_ROOT/promote-branch/home"
@@ -1984,6 +2008,7 @@ test_promote_names_origin_for_a_publishing_mode_in_an_opted_in_home
 test_promote_refuses_a_symlinked_task_record
 test_promotion_delivers_the_real_definition_of_done
 test_promotion_persists_the_selected_ship_branch
+test_worktrunk_promotion_keeps_the_scout_branch_for_teardown
 test_promotion_branch_command_is_shell_safe
 test_local_merge_uses_the_recorded_ship_branch
 test_project_mode_matches_whole_multiword_names
