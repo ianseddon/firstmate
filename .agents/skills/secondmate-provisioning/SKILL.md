@@ -77,6 +77,7 @@ A bare `<project>` remains a convenience for a project this home already has clo
 Pass `--no-projects` in the project position to seed the project-less home described above; the same mutual-exclusion and fail-loud-on-omission rules apply.
 It may only seed a home with no project clones or project-registry entries, and refuses conversion of populated homes without changing them.
 `-` durably leases a fresh firstmate worktree via `treehouse get --lease` under the secondmate id.
+`-` is treehouse-only: a home whose [worktree provider](../../../docs/configuration.md#worktree-provider-configworktree-provider) is worktrunk refuses it, so pass an explicit home path there; remote secondmates are refused there too.
 The lease survives with no live process and is never recycled by later `treehouse get` or `prune`.
 The slot stays reserved across restarts until the lease is released.
 Release happens only on explicit retirement or seed rollback, never on routine restart or recovery.
@@ -104,6 +105,7 @@ Inheritance copies the literal `config/crew-harness` file, so a secondmate's own
 Inherited `config/backend` becomes that secondmate home's local runtime-backend default for future spawns only; it never retargets, rewrites, migrates, stops, or restarts an already-live worker endpoint.
 A present primary `config/backend` value always converges byte-exact into validated secondmate homes, and primary absence removes that backend setting so those homes keep runtime auto-detection.
 Explicit per-spawn `--backend` and `FM_BACKEND` remain stronger than every home's local `config/backend`, including an inherited default.
+Inherited `config/worktree-provider` likewise selects the worktree provider for that home's future crewmate spawns only; a recorded task keeps the provider in its own meta.
 The declared `config/supervision-host-off` opt-out follows the same primary-authoritative propagation: its presence opts secondmate homes out even if they have their own engine setting, and its absence removes their copy at convergence.
 `config/supervision-host` itself is not inherited; each home selects its own engine.
 `config/secondmate-harness` is not inherited because it is only the primary's knob for launching secondmate agents.

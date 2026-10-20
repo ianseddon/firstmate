@@ -8,7 +8,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | What you want to configure | Start here |
 | --- | --- |
 | Firstmate's code, private files, or project location | [FM_HOME](#fm_home) and [operational home layout](#operational-home-layout-and-state) |
-| Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend) and [harness support](#harness-support) |
+| Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend), [worktree provider](#worktree-provider-configworktree-provider), and [harness support](#harness-support) |
 | Worker permissions, accounts, or environment | [Codex approval review](#codex-automatic-approval-review), [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [Codex permission mode](#codex-permission-mode-configcodex-permission-mode), [persistent managed-policy failover](#persistent-managed-policy-failover), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), [external memory tiers](#external-memory-tiers-memory-layering-section), [record export](#record-export-configrecord-export-root), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), [Codex native Stop park](#codex-native-stop-park-configcodex-stop-park), [warm-cache compaction](#warm-cache-compaction-configwarm-compact), and [Calm preference](#calm-preference-configcalm) |
@@ -691,6 +691,40 @@ tern uses one home-tagged session named `fm-<hometag>` (or `FM_TERN_SESSION` in 
 The caller-facing endpoint is `<session-id>:<block-id>`; tab titles are `fm-<hometag>-<id>`; ids are 64-bit integers and must keep full precision.
 Test cleanup must use the guarded path in [`docs/tern-backend.md`](tern-backend.md#current-operation-and-safety) and only sessions named `fm-test-*`.
 `config/backend` is inherited into secondmate homes under the primary-authoritative contract owned by [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md).
+
+## Worktree provider (config/worktree-provider)
+
+The worktree provider creates and removes the isolated git worktree each ship or scout works in on every session-provider-only backend (`tmux`, `herdr`, `zellij`, `cmux`, `paseo`).
+Orca owns its own task worktree and ignores this setting.
+
+Resolution order for a new spawn:
+
+1. `FM_WORKTREE_PROVIDER`.
+2. The first non-empty, non-comment line of local, gitignored `config/worktree-provider`.
+3. `treehouse`.
+
+The known values are `treehouse` and `worktrunk`.
+An unknown value is never replaced by the default: bootstrap prints `WORKTREE_PROVIDER_INVALID` and spawn refuses.
+Each task records the provider that created its worktree as `worktree_provider=` in `state/<id>.meta` (absent means treehouse), and teardown and relaunch follow that record rather than the current setting.
+`config/worktree-provider` is inherited into local secondmate homes under the primary-authoritative contract owned by [`secondmate-provisioning`](../.agents/skills/secondmate-provisioning/SKILL.md).
+
+`treehouse` is the default: spawn types `treehouse get` into the task pane and teardown runs `treehouse return`.
+
+`worktrunk` uses [worktrunk](https://worktrunk.dev) (`wt`), so the captain's own worktrunk configuration applies to firstmate workers: its `worktree-path` template and its user and project hooks.
+Firstmate runs `wt` itself with no terminal while holding the project lock, and still opens the task endpoint at the project clone before moving it into the new worktree, so no `herdr worktree` automation fires.
+
+- Spawn fetches origin, resolves the base exactly as the treehouse path does (origin's default branch, or `--base-branch`), and runs `wt -C <project> switch --create <branch> --base origin/<base> --no-cd --format json`.
+- A ship's branch is its ship branch (`--branch-prefix` plus the task id, so `feat/` gives `feat/<id>` and a worktree directory such as `feat-<id>`); a scout's is `scout/<task-id>`.
+- A branch that already exists is refused, never adopted.
+- Project hooks run but are never approved by firstmate: worktrunk cannot ask without a terminal, so spawn refuses before opening an endpoint until the captain runs `wt -C <project> config approvals add`.
+  Approvals are keyed by the project's origin, so approving once in any clone of that origin covers firstmate's clone too.
+- Hooks that write untracked files must write ignored ones (for example a copied `.env`), because spawn still refuses a worktree that is not clean; prefer blocking `pre-start` hooks over background `post-start` hooks for anything the worker needs before it starts.
+- Ship briefs tell the worker to confirm it is on the branch firstmate created instead of creating it.
+- A spawn that fails after `wt` created the worktree removes the worktree and its branch, or leaves a `cleanup_recovery=worktrunk` task record that `bin/fm-teardown.sh <id>` releases when that removal fails.
+- Teardown keeps every landed-work and dirty-worktree check, deletes the task branch itself, and then runs `wt -C <project> remove --foreground --force --no-delete-branch <worktree>`; a failed removal aborts teardown with every record kept.
+- Leasing a secondmate home with `-` (`bin/fm-home-seed.sh`) and remote secondmates are treehouse-only and refuse under worktrunk; pass an explicit home path or use a local secondmate.
+
+`tests/fm-worktrunk-provider-live-e2e.test.sh` is the token-free live guard that re-checks these `wt` behaviors against the installed binary.
 
 ## Away-mode supervisor backend (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)
 
@@ -2121,24 +2155,24 @@ The per-backend delta is required only for the backend resolved from `FM_BACKEND
 
 | Resolved backend | Additional tools |
 | --- | --- |
-| `tmux` | `tmux`, `treehouse` |
-| `herdr` | `herdr`, `jq`, `treehouse` |
-| `zellij` | `zellij`, `jq`, `treehouse` |
+| `tmux` | `tmux`, the worktree provider |
+| `herdr` | `herdr`, `jq`, the worktree provider |
+| `zellij` | `zellij`, `jq`, the worktree provider |
 | `orca` | `orca` |
-| `cmux` | `cmux`, `jq`, `treehouse` |
-| `paseo` | `paseo`, `jq`, `treehouse` |
+| `cmux` | `cmux`, `jq`, the worktree provider |
+| `paseo` | `paseo`, `jq`, the worktree provider |
 | `rex` | `rex`, `jq`, `treehouse` |
 | `t3code` | `node`, `treehouse` |
 | `tern` | `tern`, `jq`, `treehouse` |
 
 The JSON-emitting adapters (`herdr`, `zellij`, `cmux`, `paseo`, `rex`, `tern`) need `jq` because their spawn and liveness paths parse backend JSON.
-Every session-provider-only backend (`tmux`, `herdr`, `zellij`, `cmux`, `paseo`, `rex`, `t3code`, `tern`) uses `treehouse` for worktrees.
+Every session-provider-only backend (`tmux`, `herdr`, `zellij`, `cmux`, `paseo`, `rex`, `t3code`, `tern`) also needs the resolved [worktree provider](#worktree-provider-configworktree-provider)'s CLI: `treehouse` by default, or `wt` plus `jq` for `worktrunk`, which bootstrap reports as `MISSING_MANUAL: wt` because it installs by hand.
 
 Backend tool availability uses the adapter's own executable resolver, so bootstrap and spawn agree on supported non-`PATH` locations such as cmux's bundled CLI and the Rex server bundle's `rex`.
 An unknown resolved backend emits `BACKEND_INVALID` and blocks dispatch instead of silently dropping its dependency delta or falling back to tmux.
 
 Orca provides both the task worktree and terminal endpoint (see "Runtime backend" above), so `backend=orca` requires only `orca` on top of the universal toolchain and skips both `treehouse` and every other backend's session CLI.
-A herdr, zellij, cmux, paseo, rex, t3code, or tern home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
+A herdr, zellij, cmux, paseo, rex, t3code, or tern home is therefore never told `tmux` is missing, a worktrunk home is never told `treehouse` is missing, and the `treehouse` durable-lease upgrade check runs only when the resolved backend and worktree provider actually use treehouse.
 
 **Feature-specific requirements**
 
